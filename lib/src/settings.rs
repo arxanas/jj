@@ -29,6 +29,9 @@ pub struct RepoSettings {
     _config: config::Config,
 }
 
+pub const USER_NAME_PLACEHOLDER: &str = "(no name configured)";
+pub const USER_EMAIL_PLACEHOLDER: &str = "(no email configured)";
+
 impl UserSettings {
     pub fn from_config(config: config::Config) -> Self {
         let timestamp = match config.get_string("user.timestamp") {
@@ -56,13 +59,13 @@ impl UserSettings {
     pub fn user_name(&self) -> String {
         self.config
             .get_string("user.name")
-            .unwrap_or_else(|_| "(no name configured)".to_string())
+            .unwrap_or_else(|_| USER_NAME_PLACEHOLDER.to_string())
     }
 
     pub fn user_email(&self) -> String {
         self.config
             .get_string("user.email")
-            .unwrap_or_else(|_| "(no email configured)".to_string())
+            .unwrap_or_else(|_| USER_EMAIL_PLACEHOLDER.to_string())
     }
 
     pub fn push_branch_prefix(&self) -> String {

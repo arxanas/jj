@@ -4935,12 +4935,31 @@ fn cmd_git_push(
             old_heads.extend(old_head.adds());
         }
     }
+    if old_heads.is_empty() {
+        old_heads.push(repo.store().root_commit_id().clone());
+    }
     for index_entry in repo.index().walk_revs(&new_heads, &old_heads) {
         let commit = repo.store().get_commit(&index_entry.commit_id())?;
-        if commit.tree().has_conflict() {
+        let reason = if commit.description().is_empty() {
+            Some("it has no description")
+        } else if commit.author().name == jujutsu_lib::settings::USER_NAME_PLACEHOLDER
+            || commit.author().email == jujutsu_lib::settings::USER_EMAIL_PLACEHOLDER
+        {
+            Some("it has no author set")
+        } else if commit.committer().name == jujutsu_lib::settings::USER_NAME_PLACEHOLDER
+            || commit.committer().email == jujutsu_lib::settings::USER_EMAIL_PLACEHOLDER
+        {
+            Some("it has no committer set")
+        } else if commit.tree().has_conflict() {
+            Some("it has conflicts")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
             return Err(UserError(format!(
-                "Won't push commit {} since it has conflicts",
-                short_commit_hash(commit.id())
+                "Won't push commit {} since {}",
+                short_commit_hash(commit.id()),
+                reason
             )));
         }
     }
