@@ -231,12 +231,22 @@ dependencies = [
  "atty",
  "bitflags",
  "clap_derive",
- "clap_lex",
+ "clap_lex 0.2.0",
  "indexmap",
  "lazy_static",
  "strsim",
  "termcolor",
  "textwrap 0.15.0",
+]
+
+[[package]]
+name = "clap"
+version = "4.0.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06badb543e734a2d6568e19a40af66ed5364360b9226184926f89d229b4b4267"
+dependencies = [
+ "bitflags",
+ "clap_lex 0.3.0",
 ]
 
 [[package]]
@@ -271,12 +281,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "clap_mangen"
-version = "0.1.6"
+name = "clap_lex"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca2ff85c3fa1e7c1a4229f7b4221f769757c3982e2afd3e6d9381d59db2c7e61"
+checksum = "0d4198f73e42b4936b35b5bb248d81d2b595ecb170da0bac7655c54eedfa8da8"
 dependencies = [
- "clap 3.1.18",
+ "os_str_bytes",
+]
+
+[[package]]
+name = "clap_mangen"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6cb68fb090907789b55ddfcf42f03490cd9b94a6da519b75d871cf3a0963735c"
+dependencies = [
+ "clap 4.0.17",
  "roff",
 ]
 
