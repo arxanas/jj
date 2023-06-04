@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::ops::Range;
@@ -41,8 +42,14 @@ use crate::store::Store;
 /// Error occurred during symbol resolution.
 #[derive(Debug, Error)]
 pub enum RevsetResolutionError {
-    #[error("Revision \"{0}\" doesn't exist")]
-    NoSuchRevision(String),
+    #[error("Revision \"{name}\" doesn't exist{}", match candidates.first() {
+        Some(candidate) => format!("; did you mean \"{candidate}\"?"),
+        None => "".to_string(),
+    })]
+    NoSuchRevision {
+        name: String,
+        candidates: Vec<String>,
+    },
     #[error("An empty string is not a valid revision")]
     EmptyString,
     #[error("Commit ID prefix \"{0}\" is ambiguous")]
@@ -1659,10 +1666,13 @@ pub struct FailingSymbolResolver;
 
 impl SymbolResolver for FailingSymbolResolver {
     fn resolve_symbol(&self, symbol: &str) -> Result<Vec<CommitId>, RevsetResolutionError> {
-        Err(RevsetResolutionError::NoSuchRevision(format!(
-            "Won't resolve symbol {symbol:?}. When creating revsets programmatically, avoid using \
-             RevsetExpression::symbol(); use RevsetExpression::commits() instead."
-        )))
+        Err(RevsetResolutionError::NoSuchRevision {
+            name: format!(
+                "Won't resolve symbol {symbol:?}. When creating revsets programmatically, avoid \
+                 using RevsetExpression::symbol(); use RevsetExpression::commits() instead."
+            ),
+            candidates: Default::default(),
+        })
     }
 }
 
@@ -1711,7 +1721,10 @@ impl SymbolResolver for DefaultSymbolResolver<'_> {
                 if let Some(workspace_id) = self.workspace_id {
                     workspace_id.clone()
                 } else {
-                    return Err(RevsetResolutionError::NoSuchRevision(symbol.to_owned()));
+                    return Err(RevsetResolutionError::NoSuchRevision {
+                        name: symbol.to_owned(),
+                        candidates: Default::default(),
+                    });
                 }
             } else {
                 WorkspaceId::new(symbol.strip_suffix('@').unwrap().to_string())
@@ -1719,7 +1732,10 @@ impl SymbolResolver for DefaultSymbolResolver<'_> {
             if let Some(commit_id) = self.repo.view().get_wc_commit_id(&target_workspace) {
                 Ok(vec![commit_id.clone()])
             } else {
-                Err(RevsetResolutionError::NoSuchRevision(symbol.to_owned()))
+                Err(RevsetResolutionError::NoSuchRevision {
+                    name: symbol.to_owned(),
+                    candidates: Default::default(),
+                })
             }
         } else if symbol == "root" {
             Ok(vec![self.repo.store().root_commit_id().clone()])
@@ -1780,9 +1796,30 @@ impl SymbolResolver for DefaultSymbolResolver<'_> {
                 }
             }
 
-            Err(RevsetResolutionError::NoSuchRevision(symbol.to_owned()))
+            Err(RevsetResolutionError::NoSuchRevision {
+                name: symbol.to_owned(),
+                candidates: suggest_symbol(self.repo, symbol)?,
+            })
         }
     }
+}
+
+fn suggest_symbol(repo: &dyn Repo, symbol: &str) -> Result<Vec<String>, RevsetResolutionError> {
+    // Using the same algorithm as `clap-builder`:
+    // https://github.com/clap-rs/clap/blob/50f0e6bffbe28ba0d245c1789010592764a7d80d/clap_builder/src/parser/features/suggestions.rs#L16-L23
+    Ok(repo
+        .view()
+        .branches()
+        .keys()
+        .map(|candidate| (strsim::jaro(symbol, candidate), candidate))
+        .filter(|(confidence, _)| *confidence > 0.7)
+        .sorted_by(|(lhs_confidence, _), (rhs_confidence, _)| {
+            lhs_confidence
+                .partial_cmp(rhs_confidence)
+                .unwrap_or(Ordering::Equal)
+        })
+        .map(|(_, candidate)| candidate.clone())
+        .collect())
 }
 
 fn resolve_commit_ref(
@@ -1858,7 +1895,9 @@ fn resolve_symbols(
             RevsetExpression::Present(candidates) => {
                 resolve_symbols(repo, candidates.clone(), symbol_resolver)
                     .or_else(|err| match err {
-                        RevsetResolutionError::NoSuchRevision(_) => Ok(RevsetExpression::none()),
+                        RevsetResolutionError::NoSuchRevision { .. } => {
+                            Ok(RevsetExpression::none())
+                        }
                         RevsetResolutionError::EmptyString
                         | RevsetResolutionError::AmbiguousCommitIdPrefix(_)
                         | RevsetResolutionError::AmbiguousChangeIdPrefix(_)
