@@ -106,11 +106,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29
-      - uses: creyD/prettier_action@31355f8eef017f8aeba2e0bc09d8502b13dbbad1
-        with:
-          dry: true
-          prettier_plugins: "prettier-plugin-sh prettier-plugin-toml"
-          prettier_options: --check .
+      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8
+      - run: npm install
+      - run: npx prettier --check .
 
   mkdocs:
     name: Check that MkDocs can build the docs
