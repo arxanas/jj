@@ -22,7 +22,7 @@ run_command "jj log"
 
 run_command "jj diff -r first"
 run_command "jj diff -r second"
-run_command "jj diff -r third"
+run_command   "jj diff -r third"
 
 comment "Let's reorder the second and third commits:"
 run_command "jj rebase -s third -d first"
