@@ -2,17 +2,31 @@
 
 These are the config settings available to jj/Jujutsu.
 
-
 ## Config files and TOML
 
-The config settings are loaded from the following locations. Less common ways to
-specify `jj` config settings are discussed in a later section.
+`jj` loads several types of config settings:
 
-* `~/.jjconfig.toml` (global)
-* `.jj/repo/config.toml` (per-repository)
+- The built-in settings. These cannot be edited. They can be viewed in the
+  `cli/src/config/` directory in `jj`'s source repo.
 
-See the [TOML site] and the [syntax guide] for a description of the syntax.
+- The user settings. These can be edited with `jj config edit --user`. User
+  settings are located in [the user config file], which can be found with `jj
+config path --user`.
 
+- The repo settings. These can be edited with `jj config edit --repo` and are
+  located in `.jj/repo/config.toml`.
+
+- Settings [specified in the command-line](#specifying-config-on-the-command-line).
+
+These are listed in the order they are loaded; the settings from earlier items
+in
+the list are overridden by the settings from later items if they disagree. Every
+type of config except for the built-in settings is optional.
+
+See the [TOML site] and the [syntax guide] for a detailed description of the
+syntax. We cover some of the basics below.
+
+[the user config file]: #user-config-file
 [TOML site]: https://toml.io/en/
 [syntax guide]: https://toml.io/en/v1.0.0
 
@@ -20,6 +34,7 @@ The first thing to remember is that the value of a setting (the part to the
 right of the `=` sign) should be surrounded in quotes if it's a string.
 
 ### Dotted style and headings
+
 In TOML, anything under a heading can be dotted instead. For example,
 `user.name = "YOUR NAME"` is equivalent to:
 
@@ -51,7 +66,6 @@ then use whichever suits you in your config. If you mix dotted keys and headings
 That's probably enough TOML to keep you out of trouble but the [syntax guide] is
 very short if you ever need to check.
 
-
 ## User settings
 
 ```toml
@@ -65,8 +79,9 @@ Don't forget to change these to your own details!
 
 ### Colorizing output
 
-Possible values are `always`, `never` and `auto` (default: `auto`).
-`auto` will use color only when writing to a terminal.
+Possible values are `always`, `never`, `debug` and `auto` (default: `auto`).
+`auto` will use color only when writing to a terminal. `debug` will print the
+active labels alongside the regular colorized output.
 
 This setting overrides the `NO_COLOR` environment variable (if set).
 
@@ -84,23 +99,32 @@ colors.commit_id = "green"
 
 The following colors are available:
 
-* black
-* red
-* green
-* yellow
-* blue
-* magenta
-* cyan
-* white
+- black
+- red
+- green
+- yellow
+- blue
+- magenta
+- cyan
+- white
+- default
 
-They each come in a bright version too, e.g. "bright red".
+All of them but "default" come in a bright version too, e.g. "bright red". The
+"default" color can be used to override a color defined by a parent style
+(explained below).
 
-If you use a string value for a color, as in the example above, it will be used
+You can also use a 6-digit hex code for more control over the exact color used:
+
+```toml
+colors.change_id = "#ff1525"
+```
+
+If you use a string value for a color, as in the examples above, it will be used
 for the foreground color. You can also set the background color, or make the
 text bold or underlined. For that, you need to use a table:
 
 ```toml
-colors.commit_id = { fg = "green", bg = "red", bold = true, underline = true }
+colors.commit_id = { fg = "green", bg = "#ff1525", bold = true, underline = true }
 ```
 
 The key names are called "labels". The above used `commit_id` as label. You can
@@ -118,8 +142,28 @@ Parts of the style that are not overridden - such as the foreground color in the
 example above - are inherited from the parent style.
 
 Which elements can be colored is not yet documented, but see
-the [default color configuration](https://github.com/martinvonz/jj/blob/main/src/config/colors.toml)
+the [default color configuration](https://github.com/martinvonz/jj/blob/main/cli/src/config/colors.toml)
 for some examples of what's possible.
+
+### Default command
+
+When `jj` is run with no explicit subcommand, the value of the
+`ui.default-command` setting will be used instead. Possible values are any valid
+subcommand name, subcommand alias, or user-defined alias (defaults to `"log"`).
+
+```toml
+ui.default-command = ["log", "--reversed"]
+```
+
+### Default description
+
+The value of the `ui.default-description` setting will be used to prepopulate
+the editor when describing changes with an empty description. This could be a
+useful reminder to fill in things like BUG=, TESTED= etc.
+
+```toml
+ui.default-description = "\n\nTESTED=TODO"
+```
 
 ### Diff format
 
@@ -128,17 +172,93 @@ for some examples of what's possible.
 ui.diff.format = "git"
 ```
 
+### Generating diffs by external command
+
+If `ui.diff.tool` is set, the specified diff command will be called instead of
+the internal diff function.
+
+```toml
+[ui]
+# Use Difftastic by default
+diff.tool = ["difft", "--color=always", "$left", "$right"]
+# Use tool named "<name>" (see below)
+diff.tool = "<name>"
+```
+
+The external diff tool can also be enabled by `diff --tool <name>` argument.
+For the tool named `<name>`, command arguments can be configured as follows.
+
+```toml
+[merge-tools.<name>]
+# program = "<name>"  # Defaults to the name of the tool if not specified
+diff-args = ["--color=always", "$left", "$right"]
+```
+
+- `$left` and `$right` are replaced with the paths to the left and right
+  directories to diff respectively.
+
+### Set of immutable commits
+
+You can configure the set of immutable commits via `revset-aliases."immutable_heads()"`.
+The default set of immutable heads is `trunk() | tags()`. For example, to
+prevent rewriting commits on `main@origin` and commits authored by other
+users:
+
+```toml
+# The `main.. &` bit is an optimization to scan for non-`mine()` commits only
+# among commits that are not in `main`.
+revset-aliases."immutable_heads()" = "main@origin | (main@origin.. & ~mine())"
+```
+
+Ancestors of the configured set are also immutable. The root commit is always
+immutable even if the set is empty.
+
+## Log
+
+### Default revisions
+
+You can configure the revisions `jj log` would show when neither `-r` nor any paths are specified.
+
+```toml
+# Show commits that are not in `main@origin`
+revsets.log = "main@origin.."
+```
+
+The default value for `revsets.log` is `'@ | ancestors(immutable_heads().., 2) | trunk()'`.
+
 ### Graph style
 
 ```toml
-# Possible values: "curved" (default), "square", "ascii", "ascii-large",
-# "legacy" 
+# Possible values: "curved" (default), "square", "ascii", "ascii-large"
 ui.graph.style = "square"
+```
+
+#### Node style
+
+The symbols used to represent commits or operations can be customized via
+templates.
+
+- `templates.log_node` for commits (with `Option<Commit>` keywords)
+- `templates.op_log_node` for operations (with `Operation` keywords)
+
+For example:
+
+```toml
+[templates]
+log_node = '''
+coalesce(
+  if(!self, "🮀"),
+  if(current_working_copy, "@"),
+  if(root, "┴"),
+  if(immutable, "●", "○"),
+)
+'''
+op_log_node = 'if(current_operation, "@", "○")'
 ```
 
 ### Wrap log content
 
-If enabled, `log`/`obslog`/`op log` content will be wrapped based on 
+If enabled, `log`/`obslog`/`op log` content will be wrapped based on
 the terminal width.
 
 ```toml
@@ -170,13 +290,20 @@ To customize these separately, use the `format_short_commit_id()` and
 'format_short_change_id(id)' = 'format_short_id(id).upper()'
 ```
 
+To get shorter prefixes for certain revisions, set `revsets.short-prefixes`:
+
+```toml
+# Prioritize the current branch
+revsets.short-prefixes = "(main..@)::"
+```
+
 ### Relative timestamps
 
 Can be customized by the `format_timestamp()` template alias.
 
 ```toml
 [template-aliases]
-# Full timestamp in ISO 8601 format (default)
+# Full timestamp in ISO 8601 format
 'format_timestamp(timestamp)' = 'timestamp'
 # Relative timestamp rendered as "x days/hours/seconds ago"
 'format_timestamp(timestamp)' = 'timestamp.ago()'
@@ -204,6 +331,23 @@ Can be customized by the `format_short_signature()` template alias.
 'format_short_signature(signature)' = 'signature.username()'
 ```
 
+### Allow "large" revsets by default
+
+Certain commands (such as `jj rebase`) can take multiple revset arguments, but
+default to requiring each of those revsets to expand to a _single_ revision.
+This restriction can be overridden by prefixing a revset that the user wants to
+be able to expand to more than one revision with the [`all:`
+modifier](revsets.md#the-all-modifier).
+
+Another way you can override this check is by setting
+`ui.always-allow-large-revsets` to `true`. Then, `jj` will allow every one of
+the revset arguments of such commands to expand to any number of revisions.
+
+```toml
+# Assume `all:` prefix before revsets whenever it would make a difference
+ui.always-allow-large-revsets = true
+```
+
 ## Pager
 
 The default pager is can be set via `ui.pager` or the `PAGER` environment
@@ -212,7 +356,29 @@ a `$`):
 
 `ui.pager` > `$PAGER`
 
-`less -FRX` is the default pager in the absence of any other setting.
+`less -FRX` is the default pager in the absence of any other setting, except
+on Windows where it is `:builtin`.
+
+The special value `:builtin` enables usage of the
+[integrated pager](https://github.com/arijit79/minus/). It is likely if you
+are using a standard Linux distro, your system has `$PAGER` set already
+and that will be preferred over the built-in. To use the built-in:
+
+```
+jj config set --user ui.pager :builtin
+```
+
+It is possible the default will change to `:builtin` for all platforms in the
+future.
+
+Additionally, paging behavior can be toggled via `ui.paginate` like so:
+
+```toml
+# Enable pagination for commands that support it (default)
+ui.paginate = "auto"
+# Disable all pagination, equivalent to using --no-pager
+ui.paginate = "never"
+```
 
 ### Processing contents to be paged
 
@@ -221,7 +387,21 @@ If you'd like to pass the output through a formatter e.g.
 through a pager you must do it using a subshell as, unlike `git` or `hg`, the
 command will be executed directly. For example:
 
-`ui.pager = ["sh", "-c", "diff-so-fancy | less -RFX"]`
+```toml
+ui.pager = ["sh", "-c", "diff-so-fancy | less -RFX"]
+```
+
+Some formatters (like [`delta`](https://github.com/dandavison/delta)) require
+git style diffs for formatting. You can configure this style of
+diff as the default with the `ui.diff` setting. For example:
+
+```toml
+[ui]
+pager = "delta"
+
+[ui.diff]
+format = "git"
+```
 
 ## Aliases
 
@@ -230,7 +410,7 @@ You can define aliases for commands, including their arguments. For example:
 ```toml
 # `jj l` shows commits on the working-copy commit's (anonymous) branch
 # compared to the `main` branch
-aliases.l = ["log", "-r", "(main..@): | (main..@)-"]
+aliases.l = ["log", "-r", "(main..@):: | (main..@)-"]
 ```
 
 ## Editor
@@ -241,8 +421,8 @@ a `$`):
 
 `$JJ_EDITOR` > `ui.editor` > `$VISUAL` > `$EDITOR`
 
-Pico is the default editor in the absence of any other setting, but you could
-set it explicitly too.
+Pico is the default editor (Notepad on Windows) in the absence of any other
+setting, but you could set it explicitly too.
 
 ```toml
 ui.editor = "pico"
@@ -257,21 +437,30 @@ ui.editor = "nvim"
 For GUI editors you possibly need to use a `-w` or `--wait`. Some examples:
 
 ```toml
-ui.editor = "code -w"       # VS Code
-ui.editor = "bbedit -w"     # BBEdit
-ui.editor = "subl -n -w"    # Sublime Text
-ui.editor = "mate -w"       # TextMate
-ui.editor = ["C:/Program Files/Notepad++/notepad++.exe",
-    "-multiInst", "-notabbar", "-nosession", "-noPlugin"] # Notepad++
-ui.editor = "idea --temp-project --wait"   #IntelliJ
+ui.editor = "code -w" # VS Code
+ui.editor = "bbedit -w" # BBEdit
+ui.editor = "subl -n -w" # Sublime Text
+ui.editor = "mate -w" # TextMate
+ui.editor = [
+  "C:/Program Files/Notepad++/notepad++.exe",
+  "-multiInst",
+  "-notabbar",
+  "-nosession",
+  "-noPlugin",
+] # Notepad++
+ui.editor = "idea --temp-project --wait" #IntelliJ
 ```
 
 Obviously, you would only set one line, don't copy them all in!
 
 ## Editing diffs
 
-The `ui.diff-editor` setting affects the tool used for editing diffs (e.g.
-`jj split`, `jj amend -i`). The default is `meld`.
+The `ui.diff-editor` setting affects the tool used for editing diffs (e.g. `jj
+split`, `jj squash -i`). The default is the special value `:builtin`, which
+launches a built-in TUI tool (known as [scm-diff-editor]) to edit the diff in
+your terminal.
+
+[scm-diff-editor]: https://github.com/arxanas/scm-record?tab=readme-ov-file#scm-diff-editor
 
 `jj` makes the following substitutions:
 
@@ -295,18 +484,100 @@ will be read from the following config keys.
 ```toml
 # merge-tools.kdiff3.program = "kdiff3"      # Defaults to the name of the tool if not specified
 merge-tools.kdiff3.edit-args = [
-    "--merge", "--cs", "CreateBakFiles=0", "$left", "$right"]
+  "--merge",
+  "--cs",
+  "CreateBakFiles=0",
+  "$left",
+  "$right",
+]
 ```
+
+### Experimental 3-pane diff editing
+
+We offer two special "3-pane" diff editor configs:
+
+- `meld-3`, which requires installing [Meld](https://meldmerge.org/), and
+- `diffedit3`, which requires installing [`diffedit3`](https://github.com/ilyagr/diffedit3/releases).
+
+`Meld` is a graphical application that is recommended, but can be difficult to
+install in some situations. `diffedit3` is designed to be easy to install and to
+be usable in environments where Meld is difficult to use (e.g. over SSH via port
+forwarding). `diffedit3` starts a local server that can be accessed via a web
+browser, similarly to [Jupyter](https://jupyter.org/).
+
+There is also the `diffedit3-ssh` which is similar to `diffedit3` but does not
+try to open the web browser pointing to the local server (the URL
+printed to the terminal) automatically. `diffedit3-ssh` also always uses ports in between
+17376-17380 and fails if they are all busy. This can be useful when working
+over SSH. Open the fold below for more details of how to set that up.
+
+<details>
+<summary> Tips for using `diffedit3-ssh` over SSH </summary>
+
+To use `diffedit3` over SSH, you need to set up port forwarding. One way to do
+this is to start SSH as follows (copy-paste the relevant lines):
+
+```shell
+ssh -L 17376:localhost:17376 \
+  -L 17377:localhost:17377 \
+  -L 17378:localhost:17378 \
+  -L 17379:localhost:17379 \
+  -L 17380:localhost:17380 \
+  myhost.example.com
+```
+
+`diffedit3-ssh` is set up to use these 5 ports by default. Usually, only the
+first of them will be used. The rest are used if another program happens to use
+one of them, or if you run multiple instances of `diffedit3` at the same time.
+
+Another way is to add a snippet to `~/.ssh/config`:
+
+```
+Host myhost
+    User     myself
+    Hostname myhost.example.com
+    LocalForward 17376 localhost:17376
+    LocalForward 17377 localhost:17377
+    LocalForward 17378 localhost:17378
+    LocalForward 17379 localhost:17379
+    LocalForward 17380 localhost:17380
+```
+
+With that configuration, you should be able to simply `ssh myhost`.
+
+</details>
+
+Setting either `ui.diff-editor = "meld-3"` or `ui.diff-editor = "diffedit3"`
+will result in the diff editor showing 3 panes: the diff on the left and right,
+and an editing pane in the middle. This allow you to see both sides of the
+original diff while editing.
+
+If you use `ui.diff-editor = "meld-3"`, note that you can still get the 2-pane
+Meld view using `jj diff --tool meld`. `diffedit3` has a button you can use to
+switch to a 2-pane view.
+
+To configure other diff editors in this way, you can include `$output` together
+with `$left` and `$right` in `merge-tools.TOOL.edit-args`. `jj` will replace
+`$output` with the directory where the diff editor will be expected to put the
+result of the user's edits. Initially, the contents of `$output` will be the
+same as the contents of `$right`.
+
+### `JJ-INSTRUCTIONS`
+
+When editing a diff, jj will include a synthetic file called `JJ-INSTRUCTIONS`
+in the diff with instructions on how to edit the diff. Any changes you make to
+this file will be ignored. To suppress the creation of this file, set
+`ui.diff-instructions = false`.
 
 ### Using Vim as a diff editor
 
 Using `ui.diff-editor = "vimdiff"` is possible but not recommended. For a better
-experience, you can follow these [instructions] to configure
-the [`DirDiff` Vim plugin].
+experience, you can follow [instructions from the Wiki] to configure the
+[DirDiff Vim plugin] and/or the [vimtabdiff Python script].
 
-[instructions]: https://gist.github.com/ilyagr/5d6339fb7dac5e7ab06fe1561ec62d45
-
-[`DirDiff` Vim plugin]: https://github.com/will133/vim-dirdiff
+[instructions from the Wiki]: https://github.com/martinvonz/jj/wiki/Vim#using-vim-as-a-diff-tool
+[DirDiff Vim plugin]: https://github.com/will133/vim-dirdiff
+[vimtabdiff Python script]: https://github.com/balki/vimtabdiff
 
 ## 3-way merge tools for conflict resolution
 
@@ -315,13 +586,19 @@ by `jj resolve`. For example:
 
 ```toml
 # Use merge-tools.meld.merge-args
-ui.merge-editor = "meld"  # Or "kdiff3" or "vimdiff"
+ui.merge-editor = "meld" # Or "vscode" or "kdiff3" or "vimdiff"
 # Specify merge-args inline
 ui.merge-editor = ["meld", "$left", "$base", "$right", "-o", "$output"]
 ```
 
-The "meld", "kdiff3", and "vimdiff" tools can be used out of the box, as long as
-they are installed.
+The "vscode", "meld", "kdiff3", and "vimdiff" tools can be used out of the box,
+as long as they are installed.
+
+Using VS Code as a merge tool works well with VS Code's [Remote
+Development](https://code.visualstudio.com/docs/remote/remote-overview)
+functionality, as long as `jj` is called from VS Code's terminal.
+
+### Setting up a custom merge tool
 
 To use a different tool named `TOOL`, the arguments to pass to the tool MUST be
 specified either inline or in the `merge-tools.TOOL.merge-args` key. As an
@@ -331,15 +608,40 @@ to copy it to your config file verbatim, but you are welcome to customize it.)
 
 ```toml
 # merge-tools.kdiff3.program  = "kdiff3"     # Defaults to the name of the tool if not specified
-merge-tools.kdiff3.merge-args = ["$base", "$left", "$right", "-o", "$output", "--auto"]
-merge-tools.meld.merge-args = ["$left", "$base", "$right", "-o", "$output", "--auto-merge"]
+merge-tools.kdiff3.merge-args = [
+  "$base",
+  "$left",
+  "$right",
+  "-o",
+  "$output",
+  "--auto",
+]
+merge-tools.meld.merge-args = [
+  "$left",
+  "$base",
+  "$right",
+  "-o",
+  "$output",
+  "--auto-merge",
+]
 
-merge-tools.vimdiff.merge-args = ["-f", "-d", "$output", "-M",
-    "$left", "$base", "$right",
-    "-c", "wincmd J", "-c", "set modifiable",
-    "-c", "set write"]
+merge-tools.vimdiff.merge-args = [
+  "-f",
+  "-d",
+  "$output",
+  "-M",
+  "$left",
+  "$base",
+  "$right",
+  "-c",
+  "wincmd J",
+  "-c",
+  "set modifiable",
+  "-c",
+  "set write",
+]
 merge-tools.vimdiff.program = "vim"
-merge-tools.vimdiff.merge-tool-edits-conflict-markers = true    # See below for an explanation
+merge-tools.vimdiff.merge-tool-edits-conflict-markers = true # See below for an explanation
 ```
 
 `jj` makes the following substitutions:
@@ -372,36 +674,210 @@ the conflict is done, `jj` assumes that the conflict was only partially resolved
 and parses the conflict markers to get the new state of the conflict. The
 conflict is considered fully resolved when there are no conflict markers left.
 
+## Commit Signing
+
+`jj` can be configured to sign and verify the commits it creates using either
+GnuPG or SSH signing keys.
+
+To do this you need to configure a signing backend.
+
+### GnuPG Signing
+
+```toml
+[signing]
+sign-all = true
+backend = "gpg"
+key = "4ED556E9729E000F"
+## You can set `key` to anything accepted by `gpg -u`
+# key = "signing@example.com"
+```
+
+By default the gpg backend will look for a `gpg` binary on your path. If you want
+to change the program used or specify a path to `gpg` explicitly you can set:
+
+```toml
+signing.backends.gpg.program = "gpg2"
+```
+
+Also by default the gpg backend will ignore key expiry when verifying commit signatures.
+To consider expired keys as invalid you can set:
+
+```toml
+signing.backends.gpg.allow-expired-keys = false
+```
+
+### SSH Signing
+
+```toml
+[signing]
+sign-all = true
+backend = "ssh"
+key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGj+J6N6SO+4P8dOZqfR1oiay2yxhhHnagH52avUqw5h"
+## You can also use a path instead of embedding the key
+# key = "/home/me/.ssh/id_for_signing.pub"
+```
+
+By default the ssh backend will look for a `ssh-keygen` binary on your path. If you want
+to change the program used or specify a path to `ssh-keygen` explicitly you can set:
+
+```toml
+signing.backends.ssh.program = "/path/to/ssh-keygen"
+```
+
+When verifying commit signatures the ssh backend needs to be provided with an allowed-signers
+file containing the public keys of authors whose signatures you want to be able to verify.
+
+You can find the format for this file in the
+[ssh-keygen man page](https://man.openbsd.org/ssh-keygen#ALLOWED_SIGNERS). This can be provided
+as follows:
+
+```toml
+signing.backends.ssh.allowed-signers = "/path/to/allowed-signers"
+```
+
 ## Git settings
+
+### Default remotes for `jj git fetch` and `jj git push`
+
+By default, if a single remote exists it is used for `jj git fetch` and `jj git
+push`; however if multiple remotes exist, the default remote is assumed to be
+named `"origin"`, just like in Git. Sometimes this is undesirable, e.g. when you
+want to fetch from a different remote than you push to, such as a GitHub fork.
+
+To change this behavior, you can modify the [repository
+configuration](#config-files-and-toml) variable `git.fetch`, which can be a
+single remote, or a list of remotes to fetch from multiple places:
+
+```sh
+jj config set --repo git.fetch "upstream"
+jj config set --repo git.fetch '["origin", "upstream"]'
+```
+
+Similarly, you can also set the variable `git.push` to cause `jj git push` to
+push to a different remote:
+
+```sh
+jj config set --repo git.push "github"
+```
+
+Note that unlike `git.fetch`, `git.push` can currently only be a single remote.
+This is not a hard limitation, and could be changed in the future if there is
+demand.
 
 ### Automatic local branch creation
 
-By default, when `jj` imports a remote-tracking branch from Git, it also
-creates a local branch with the same name. In some repositories, this
-may be undesirable, e.g.:
+When `jj` imports a new remote-tracking branch from Git, it can also create a
+local branch with the same name. This feature is disabled by default because it
+may be undesirable in some repositories, e.g.:
 
 - There is a remote with a lot of historical branches that you don't
   want to be exported to the co-located Git repo.
 - There are multiple remotes with conflicting views of that branch,
   resulting in an unhelpful conflicted state.
 
-You can disable this behavior by setting `git.auto-local-branch` like
-so,
+You can enable this behavior by setting `git.auto-local-branch` like so,
 
-    git.auto-local-branch = false
+```toml
+git.auto-local-branch = true
+```
 
-Note that this setting may make it easier to accidentally delete remote
-branches. Since the local branch isn't created, the remote branch will be
-deleted if you push the branch with `jj git push --branch` or `jj git push
---all`.
+This setting is applied only to new remote branches. Existing remote branches
+can be tracked individually by using `jj branch track`/`untrack` commands.
 
-# Alternative ways to specify configuration settings
+```shell
+# import feature1 branch and start tracking it
+jj branch track feature1@origin
+# delete local gh-pages branch and stop tracking it
+jj branch delete gh-pages
+jj branch untrack gh-pages@upstream
+```
 
-Instead of `~/.jjconfig.toml`, the config settings can be located at
-`$XDG_CONFIG_HOME/jj/config.toml` as per the [XDG specification]. It is an error
-for both of these files to exist.
+### Abandon commits that became unreachable in Git
 
-[XDG specification]: https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
+By default, when `jj` imports refs from Git, it will look for commits that used
+to be [reachable][reachable] but no longer are reachable. Those commits will
+then be abandoned, and any descendant commits will be rebased off of them (as
+usual when commits are abandoned). You can disable this behavior and instead
+leave the Git-unreachable commits in your repo by setting:
+
+```toml
+git.abandon-unreachable-commits = false
+```
+
+[reachable]: https://git-scm.com/docs/gitglossary/#Documentation/gitglossary.txt-aiddefreachableareachable
+
+### Prefix for generated branches on push
+
+`jj git push --change` generates branch names with a prefix of "push-" by
+default. You can pick a different prefix by setting `git.push-branch-prefix`. For
+example:
+
+    git.push-branch-prefix = "martinvonz/push-"
+
+## Filesystem monitor
+
+In large repositories, it may be beneficial to use a "filesystem monitor" to
+track changes to the working copy. This allows `jj` to take working copy
+snapshots without having to rescan the entire working copy.
+
+This is governed by the `core.fsmonitor` option. Currently, the valid values are
+`"none"` or `"watchman"`.
+
+### Watchman
+
+To configure the Watchman filesystem monitor, set
+`core.fsmonitor = "watchman"`. Ensure that you have [installed the Watchman
+executable on your system](https://facebook.github.io/watchman/docs/install).
+
+You can check whether Watchman is enabled and whether it is installed correctly
+using `jj debug watchman status`.
+
+## Snapshot settings
+
+### Maximum size for new files
+
+By default, as an anti-footgun measure, `jj` will refuse to add new files to the
+snapshot that are larger than a certain size; the default is 1MiB. This can be
+changed by setting `snapshot.max-new-file-size` to a different value. For
+example:
+
+```toml
+snapshot.max-new-file-size = "10MiB"
+# the following is equivalent
+snapshot.max-new-file-size = 10485760
+```
+
+The value can be specified using a human readable string with typical suffixes;
+`B`, `MiB`, `GB`, etc. By default, if no suffix is provided, or the value is a
+raw integer literal, the value is interpreted as if it were specified in bytes.
+
+Files that already exist in the working copy are not subject to this limit.
+
+Setting this value to zero will disable the limit entirely.
+
+## Ways to specify `jj` config: details
+
+### User config file
+
+An easy way to find the user config file is:
+
+```bash
+jj config path --user
+```
+
+The rest of this section covers the details of where this file can be located.
+
+On all platforms, the user's global `jj` configuration file is located at either
+`~/.jjconfig.toml` (where `~` represents `$HOME` on Unix-likes, or
+`%USERPROFILE%` on Windows) or in a platform-specific directory. The
+platform-specific location is recommended for better integration with platform
+services. It is an error for both of these files to exist.
+
+| Platform | Value                                              | Example                                                   |
+| :------- | :------------------------------------------------- | :-------------------------------------------------------- |
+| Linux    | `$XDG_CONFIG_HOME/jj/config.toml`                  | `/home/alice/.config/jj/config.toml`                      |
+| macOS    | `$HOME/Library/Application Support/jj/config.toml` | `/Users/Alice/Library/Application Support/jj/config.toml` |
+| Windows  | `{FOLDERID_RoamingAppData}\jj\config.toml`         | `C:\Users\Alice\AppData\Roaming\jj\config.toml`           |
 
 The location of the `jj` config file can also be overridden with the
 `JJ_CONFIG` environment variable. If it is not empty, it should contain the path
@@ -409,15 +885,17 @@ to a TOML file that will be used instead of any configuration file in the
 default locations. For example,
 
 ```shell
-env JJ_CONFIG=/dev/null jj log       # Ignores any settings specified in the config file.
+env JJ_CONFIG=/dev/null jj log # Ignores any settings specified in the config file.
 ```
+
+### Specifying config on the command-line
 
 You can use one or more `--config-toml` options on the command line to specify
 additional configuration settings. This overrides settings defined in config
 files or environment variables. For example,
 
 ```shell
-jj --config-toml='ui.color="always"' --config-toml='ui.difftool="kdiff3"' split
+jj --config-toml='ui.color="always"' --config-toml='ui.diff-editor="kdiff3"' split
 ```
 
 Config specified this way must be valid TOML. In particular, string values must

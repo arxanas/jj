@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::{BTreeMap, HashSet};
+#![allow(missing_docs)]
+
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::backend;
-use crate::backend::{TreeId, TreeValue};
-use crate::repo_path::{RepoPath, RepoPathJoin};
+use crate::backend::{self, BackendResult, TreeId, TreeValue};
+use crate::repo_path::{RepoPath, RepoPathBuf};
 use crate::store::Store;
 use crate::tree::Tree;
 
@@ -31,7 +32,7 @@ enum Override {
 pub struct TreeBuilder {
     store: Arc<Store>,
     base_tree_id: TreeId,
-    overrides: BTreeMap<RepoPath, Override>,
+    overrides: BTreeMap<RepoPathBuf, Override>,
 }
 
 impl TreeBuilder {
@@ -48,104 +49,105 @@ impl TreeBuilder {
         self.store.as_ref()
     }
 
-    pub fn has_overrides(&self) -> bool {
-        !self.overrides.is_empty()
-    }
-
-    pub fn set(&mut self, path: RepoPath, value: TreeValue) {
+    pub fn set(&mut self, path: RepoPathBuf, value: TreeValue) {
+        assert!(!path.is_root());
         self.overrides.insert(path, Override::Replace(value));
     }
 
-    pub fn remove(&mut self, path: RepoPath) {
+    pub fn remove(&mut self, path: RepoPathBuf) {
+        assert!(!path.is_root());
         self.overrides.insert(path, Override::Tombstone);
     }
 
-    pub fn write_tree(mut self) -> TreeId {
-        let mut trees_to_write = self.get_base_trees();
-        if trees_to_write.is_empty() {
-            return self.base_tree_id;
-        }
-
-        // Update entries in parent trees for file overrides
-        for (path, file_override) in self.overrides {
-            if let Some((dir, basename)) = path.split() {
-                let tree = trees_to_write.get_mut(&dir).unwrap();
-                match file_override {
-                    Override::Replace(value) => {
-                        tree.set(basename.clone(), value);
-                    }
-                    Override::Tombstone => {
-                        tree.remove(basename);
-                    }
-                }
-            }
-        }
-
-        // Write trees level by level, starting with trees without children.
-        let store = self.store.as_ref();
-        loop {
-            let mut dirs_to_write: HashSet<RepoPath> = trees_to_write.keys().cloned().collect();
-
-            for dir in trees_to_write.keys() {
-                if let Some(parent) = dir.parent() {
-                    dirs_to_write.remove(&parent);
-                }
-            }
-
-            for dir in dirs_to_write {
-                let tree = trees_to_write.remove(&dir).unwrap();
-
-                if let Some((parent, basename)) = dir.split() {
-                    let parent_tree = trees_to_write.get_mut(&parent).unwrap();
-                    if tree.is_empty() {
-                        parent_tree.remove(basename);
-                    } else {
-                        let tree_id = store.write_tree(&dir, &tree).unwrap();
-                        parent_tree.set(basename.clone(), TreeValue::Tree(tree_id));
-                    }
-                } else {
-                    // We're writing the root tree. Write it even if empty. Return its id.
-                    return store.write_tree(&dir, &tree).unwrap();
-                }
-            }
+    pub fn set_or_remove(&mut self, path: RepoPathBuf, value: Option<TreeValue>) {
+        assert!(!path.is_root());
+        if let Some(value) = value {
+            self.overrides.insert(path, Override::Replace(value));
+        } else {
+            self.overrides.insert(path, Override::Tombstone);
         }
     }
 
-    fn get_base_trees(&mut self) -> BTreeMap<RepoPath, backend::Tree> {
-        let mut tree_cache = BTreeMap::new();
-        let mut base_trees = BTreeMap::new();
-        let store = self.store.clone();
+    pub fn write_tree(self) -> BackendResult<TreeId> {
+        if self.overrides.is_empty() {
+            return Ok(self.base_tree_id);
+        }
 
-        let mut populate_trees = |dir: &RepoPath| {
-            let mut current_dir = RepoPath::root();
+        let mut trees_to_write = self.get_base_trees()?;
 
-            if !tree_cache.contains_key(&current_dir) {
-                let tree = store.get_tree(&current_dir, &self.base_tree_id).unwrap();
-                let store_tree = tree.data().clone();
-                tree_cache.insert(current_dir.clone(), tree);
-                base_trees.insert(current_dir.clone(), store_tree);
-            }
-
-            for component in dir.components() {
-                let next_dir = current_dir.join(component);
-                let current_tree = tree_cache.get(&current_dir).unwrap();
-                if !tree_cache.contains_key(&next_dir) {
-                    let tree = current_tree
-                        .sub_tree(component)
-                        .unwrap_or_else(|| Tree::null(self.store.clone(), next_dir.clone()));
-                    let store_tree = tree.data().clone();
-                    tree_cache.insert(next_dir.clone(), tree);
-                    base_trees.insert(next_dir.clone(), store_tree);
+        // Update entries in parent trees for file overrides
+        for (path, file_override) in self.overrides {
+            let (dir, basename) = path.split().unwrap();
+            let tree = trees_to_write.get_mut(dir).unwrap();
+            match file_override {
+                Override::Replace(value) => {
+                    tree.set(basename.to_owned(), value);
                 }
-                current_dir = next_dir;
-            }
-        };
-        for path in self.overrides.keys() {
-            if let Some(parent) = path.parent() {
-                populate_trees(&parent);
+                Override::Tombstone => {
+                    tree.remove(basename);
+                }
             }
         }
 
-        base_trees
+        // Write trees in reverse lexicographical order, starting with trees without
+        // children.
+        let store = &self.store;
+        while let Some((dir, tree)) = trees_to_write.pop_last() {
+            if let Some((parent, basename)) = dir.split() {
+                let parent_tree = trees_to_write.get_mut(parent).unwrap();
+                if tree.is_empty() {
+                    if let Some(TreeValue::Tree(_)) = parent_tree.value(basename) {
+                        parent_tree.remove(basename);
+                    } else {
+                        // Entry would have been replaced with file (see above)
+                    }
+                } else {
+                    let tree = store.write_tree(&dir, tree)?;
+                    parent_tree.set(basename.to_owned(), TreeValue::Tree(tree.id().clone()));
+                }
+            } else {
+                // We're writing the root tree. Write it even if empty. Return its id.
+                assert!(trees_to_write.is_empty());
+                let written_tree = store.write_tree(&dir, tree)?;
+                return Ok(written_tree.id().clone());
+            }
+        }
+
+        unreachable!("trees_to_write must contain the root tree");
+    }
+
+    fn get_base_trees(&self) -> BackendResult<BTreeMap<RepoPathBuf, backend::Tree>> {
+        let store = &self.store;
+        let mut tree_cache = {
+            let dir = RepoPathBuf::root();
+            let tree = store.get_tree(&dir, &self.base_tree_id)?;
+            BTreeMap::from([(dir, tree)])
+        };
+
+        fn populate_trees<'a>(
+            tree_cache: &'a mut BTreeMap<RepoPathBuf, Tree>,
+            store: &Arc<Store>,
+            dir: &RepoPath,
+        ) -> BackendResult<&'a Tree> {
+            // `if let Some(tree) = ...` doesn't pass lifetime check as of Rust 1.76.0
+            if tree_cache.contains_key(dir) {
+                return Ok(tree_cache.get(dir).unwrap());
+            }
+            let (parent, basename) = dir.split().expect("root must be populated");
+            let tree = populate_trees(tree_cache, store, parent)?
+                .sub_tree(basename)?
+                .unwrap_or_else(|| Tree::null(store.clone(), dir.to_owned()));
+            Ok(tree_cache.entry(dir.to_owned()).or_insert(tree))
+        }
+
+        for path in self.overrides.keys() {
+            let parent = path.parent().unwrap();
+            populate_trees(&mut tree_cache, store, parent)?;
+        }
+
+        Ok(tree_cache
+            .into_iter()
+            .map(|(dir, tree)| (dir, tree.data().clone()))
+            .collect())
     }
 }

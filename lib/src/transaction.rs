@@ -12,18 +12,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(missing_docs)]
+
 use std::sync::Arc;
 
+use itertools::Itertools as _;
+
 use crate::backend::Timestamp;
-use crate::dag_walk::closest_common_node;
 use crate::index::ReadonlyIndex;
-use crate::op_store;
+use crate::op_heads_store::OpHeadsStore;
 use crate::op_store::OperationMetadata;
 use crate::operation::Operation;
-use crate::repo::{MutableRepo, ReadonlyRepo, Repo, RepoLoader};
+use crate::repo::{MutableRepo, ReadonlyRepo, Repo, RepoLoader, RepoLoaderError};
 use crate::settings::UserSettings;
 use crate::view::View;
+use crate::{dag_walk, op_store};
 
+/// An in-memory representation of a repo and any changes being made to it.
+///
+/// Within the scope of a transaction, changes to the repository are made
+/// in-memory to `mut_repo` and published to the repo backend when
+/// [`Transaction::commit`] is called. When a transaction is committed, it
+/// becomes atomically visible as an Operation in the op log that represents the
+/// transaction itself, and as a View that represents the state of the repo
+/// after the transaction. This is similar to how a Commit represents a change
+/// to the contents of the repository and a Tree represents the repository's
+/// contents after the change. See the documentation for [`op_store::Operation`]
+/// and [`op_store::View`] for more information.
 pub struct Transaction {
     mut_repo: MutableRepo,
     parent_ops: Vec<Operation>,
@@ -32,13 +47,9 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub fn new(
-        mut_repo: MutableRepo,
-        user_settings: &UserSettings,
-        description: &str,
-    ) -> Transaction {
+    pub fn new(mut_repo: MutableRepo, user_settings: &UserSettings) -> Transaction {
         let parent_ops = vec![mut_repo.base_repo().operation().clone()];
-        let op_metadata = create_op_metadata(user_settings, description.to_string());
+        let op_metadata = create_op_metadata(user_settings, "".to_string(), false);
         let end_time = user_settings.operation_timestamp();
         Transaction {
             mut_repo,
@@ -64,31 +75,36 @@ impl Transaction {
         &mut self.mut_repo
     }
 
-    pub fn merge_operation(&mut self, other_op: Operation) {
-        let ancestor_op = closest_common_node(
-            self.parent_ops.clone(),
-            vec![other_op.clone()],
-            &|op: &Operation| op.parents(),
-            &|op: &Operation| op.id().clone(),
-        )
+    pub fn merge_operation(&mut self, other_op: Operation) -> Result<(), RepoLoaderError> {
+        let ancestor_op = dag_walk::closest_common_node_ok(
+            self.parent_ops.iter().cloned().map(Ok),
+            [Ok(other_op.clone())],
+            |op: &Operation| op.id().clone(),
+            |op: &Operation| op.parents().collect_vec(),
+        )?
         .unwrap();
         let repo_loader = self.base_repo().loader();
-        let base_repo = repo_loader.load_at(&ancestor_op);
-        let other_repo = repo_loader.load_at(&other_op);
+        let base_repo = repo_loader.load_at(&ancestor_op)?;
+        let other_repo = repo_loader.load_at(&other_op)?;
         self.parent_ops.push(other_op);
         let merged_repo = self.mut_repo();
         merged_repo.merge(&base_repo, &other_repo);
+        Ok(())
+    }
+
+    pub fn set_is_snapshot(&mut self, is_snapshot: bool) {
+        self.op_metadata.is_snapshot = is_snapshot;
     }
 
     /// Writes the transaction to the operation store and publishes it.
-    pub fn commit(self) -> Arc<ReadonlyRepo> {
-        self.write().publish()
+    pub fn commit(self, description: impl Into<String>) -> Arc<ReadonlyRepo> {
+        self.write(description).publish()
     }
 
     /// Writes the transaction to the operation store, but does not publish it.
     /// That means that a repo can be loaded at the operation, but the
     /// operation will not be seen when loading the repo at head.
-    pub fn write(mut self) -> UnpublishedOperation {
+    pub fn write(mut self, description: impl Into<String>) -> UnpublishedOperation {
         let mut_repo = self.mut_repo;
         // TODO: Should we instead just do the rebasing here if necessary?
         assert!(
@@ -99,6 +115,7 @@ impl Transaction {
         let (mut_index, view) = mut_repo.consume();
 
         let view_id = base_repo.op_store().write_view(view.store_view()).unwrap();
+        self.op_metadata.description = description.into();
         self.op_metadata.end_time = self.end_time.unwrap_or_else(Timestamp::now);
         let parents = self.parent_ops.iter().map(|op| op.id().clone()).collect();
         let store_operation = op_store::Operation {
@@ -114,13 +131,17 @@ impl Transaction {
 
         let index = base_repo
             .index_store()
-            .write_index(mut_index, operation.id())
+            .write_index(mut_index, &operation)
             .unwrap();
-        UnpublishedOperation::new(base_repo.loader(), operation, view, index)
+        UnpublishedOperation::new(&base_repo.loader(), operation, view, index)
     }
 }
 
-pub fn create_op_metadata(user_settings: &UserSettings, description: String) -> OperationMetadata {
+pub fn create_op_metadata(
+    user_settings: &UserSettings,
+    description: String,
+    is_snapshot: bool,
+) -> OperationMetadata {
     let start_time = user_settings
         .operation_timestamp()
         .unwrap_or_else(Timestamp::now);
@@ -133,72 +154,48 @@ pub fn create_op_metadata(user_settings: &UserSettings, description: String) -> 
         description,
         hostname,
         username,
+        is_snapshot,
         tags: Default::default(),
     }
 }
 
-struct NewRepoData {
-    operation: Operation,
-    view: View,
-    index: Box<dyn ReadonlyIndex>,
-}
-
+/// An Operation which has been written to the operation store but not
+/// published. The repo can be loaded at an unpublished Operation, but the
+/// Operation will not be visible in the op log if the repo is loaded at head.
+///
+/// Either [`Self::publish`] or [`Self::leave_unpublished`] must be called to
+/// finish the operation.
+#[must_use = "Either publish() or leave_unpublished() must be called to finish the operation."]
 pub struct UnpublishedOperation {
-    repo_loader: RepoLoader,
-    data: Option<NewRepoData>,
-    closed: bool,
+    op_heads_store: Arc<dyn OpHeadsStore>,
+    repo: Arc<ReadonlyRepo>,
 }
 
 impl UnpublishedOperation {
     fn new(
-        repo_loader: RepoLoader,
+        repo_loader: &RepoLoader,
         operation: Operation,
         view: View,
         index: Box<dyn ReadonlyIndex>,
     ) -> Self {
-        let data = Some(NewRepoData {
-            operation,
-            view,
-            index,
-        });
         UnpublishedOperation {
-            repo_loader,
-            data,
-            closed: false,
+            op_heads_store: repo_loader.op_heads_store().clone(),
+            repo: repo_loader.create_from(operation, view, index),
         }
     }
 
     pub fn operation(&self) -> &Operation {
-        &self.data.as_ref().unwrap().operation
+        self.repo.operation()
     }
 
-    pub fn publish(mut self) -> Arc<ReadonlyRepo> {
-        let data = self.data.take().unwrap();
-        self.repo_loader
-            .op_heads_store()
-            .lock()
-            .promote_new_op(&data.operation);
-        let repo = self
-            .repo_loader
-            .create_from(data.operation, data.view, data.index);
-        self.closed = true;
-        repo
+    pub fn publish(self) -> Arc<ReadonlyRepo> {
+        let _lock = self.op_heads_store.lock();
+        self.op_heads_store
+            .update_op_heads(self.operation().parent_ids(), self.operation().id());
+        self.repo
     }
 
-    pub fn leave_unpublished(mut self) -> Arc<ReadonlyRepo> {
-        let data = self.data.take().unwrap();
-        let repo = self
-            .repo_loader
-            .create_from(data.operation, data.view, data.index);
-        self.closed = true;
-        repo
-    }
-}
-
-impl Drop for UnpublishedOperation {
-    fn drop(&mut self) {
-        if !self.closed && !std::thread::panicking() {
-            eprintln!("BUG: UnpublishedOperation was dropped without being closed.");
-        }
+    pub fn leave_unpublished(self) -> Arc<ReadonlyRepo> {
+        self.repo
     }
 }

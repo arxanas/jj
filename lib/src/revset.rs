@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
+#![allow(missing_docs)]
+
+use std::any::Any;
+use std::collections::{hash_map, HashMap};
+use std::convert::Infallible;
 use std::ops::Range;
 use std::path::Path;
 use std::rc::Rc;
@@ -22,180 +26,136 @@ use std::{error, fmt};
 
 use itertools::Itertools;
 use once_cell::sync::Lazy;
-use pest::iterators::{Pair, Pairs};
-use pest::pratt_parser::{Assoc, Op, PrattParser};
-use pest::Parser;
-use pest_derive::Parser;
+use pest::iterators::Pair;
 use thiserror::Error;
 
-use crate::backend::{BackendError, BackendResult, ChangeId, CommitId, ObjectId};
+use crate::backend::{BackendError, BackendResult, ChangeId, CommitId};
 use crate::commit::Commit;
+use crate::dsl_util::{collect_similar, AliasId};
+use crate::fileset::{FilePattern, FilesetExpression, FilesetParseContext};
+use crate::git;
 use crate::hex_util::to_forward_hex;
-use crate::index::{HexPrefix, PrefixResolution};
+use crate::id_prefix::IdPrefixContext;
+use crate::object_id::{HexPrefix, PrefixResolution};
 use crate::op_store::WorkspaceId;
 use crate::repo::Repo;
-use crate::repo_path::{FsPathParseError, RepoPath};
+use crate::revset_graph::RevsetGraphEdge;
+// TODO: introduce AST types and remove parse_expression_rule, Rule from the
+// re-exports
+pub use crate::revset_parser::{
+    expect_arguments, expect_named_arguments, expect_named_arguments_vec, expect_no_arguments,
+    expect_one_argument, parse_expression_rule, RevsetAliasesMap, RevsetParseError,
+    RevsetParseErrorKind, Rule,
+};
+use crate::revset_parser::{parse_program, parse_program_with_modifier};
 use crate::store::Store;
+use crate::str_util::StringPattern;
 
+/// Error occurred during symbol resolution.
 #[derive(Debug, Error)]
-pub enum RevsetError {
-    #[error("Revision \"{0}\" doesn't exist")]
-    NoSuchRevision(String),
-    #[error("Commit or change id prefix \"{0}\" is ambiguous")]
-    AmbiguousIdPrefix(String),
-    #[error("Unexpected error from store: {0}")]
-    StoreError(#[source] BackendError),
-}
-
-#[derive(Parser)]
-#[grammar = "revset.pest"]
-pub struct RevsetParser;
-
-#[derive(Debug)]
-pub struct RevsetParseError {
-    kind: RevsetParseErrorKind,
-    pest_error: Option<Box<pest::error::Error<Rule>>>,
-    origin: Option<Box<RevsetParseError>>,
-}
-
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum RevsetParseErrorKind {
-    #[error("Syntax error")]
-    SyntaxError,
-    #[error("'{op}' is not a postfix operator")]
-    NotPostfixOperator {
-        op: String,
-        similar_op: String,
-        description: String,
-    },
-    #[error("'{op}' is not an infix operator")]
-    NotInfixOperator {
-        op: String,
-        similar_op: String,
-        description: String,
-    },
-    #[error(r#"Revset function "{name}" doesn't exist"#)]
-    NoSuchFunction {
+pub enum RevsetResolutionError {
+    #[error("Revision \"{name}\" doesn't exist")]
+    NoSuchRevision {
         name: String,
         candidates: Vec<String>,
     },
-    #[error("Invalid arguments to revset function \"{name}\": {message}")]
-    InvalidFunctionArguments { name: String, message: String },
-    #[error("Invalid file pattern: {0}")]
-    FsPathParseError(#[source] FsPathParseError),
-    #[error("Cannot resolve file pattern without workspace")]
-    FsPathWithoutWorkspace,
-    #[error("Redefinition of function parameter")]
-    RedefinedFunctionParameter,
-    #[error(r#"Alias "{0}" cannot be expanded"#)]
-    BadAliasExpansion(String),
-    #[error(r#"Alias "{0}" expanded recursively"#)]
-    RecursiveAlias(String),
+    #[error("Workspace \"{name}\" doesn't have a working copy")]
+    WorkspaceMissingWorkingCopy { name: String },
+    #[error("An empty string is not a valid revision")]
+    EmptyString,
+    #[error("Commit ID prefix \"{0}\" is ambiguous")]
+    AmbiguousCommitIdPrefix(String),
+    #[error("Change ID prefix \"{0}\" is ambiguous")]
+    AmbiguousChangeIdPrefix(String),
+    #[error("Unexpected error from store")]
+    StoreError(#[source] BackendError),
+    #[error(transparent)]
+    Other(#[from] Box<dyn std::error::Error + Send + Sync>),
 }
 
-impl RevsetParseError {
-    fn new(kind: RevsetParseErrorKind) -> Self {
-        RevsetParseError {
-            kind,
-            pest_error: None,
-            origin: None,
-        }
-    }
-
-    fn with_span(kind: RevsetParseErrorKind, span: pest::Span<'_>) -> Self {
-        let err = pest::error::Error::new_from_span(
-            pest::error::ErrorVariant::CustomError {
-                message: kind.to_string(),
-            },
-            span,
-        );
-        RevsetParseError {
-            kind,
-            pest_error: Some(Box::new(err)),
-            origin: None,
-        }
-    }
-
-    fn with_span_and_origin(
-        kind: RevsetParseErrorKind,
-        span: pest::Span<'_>,
-        origin: Self,
-    ) -> Self {
-        let err = pest::error::Error::new_from_span(
-            pest::error::ErrorVariant::CustomError {
-                message: kind.to_string(),
-            },
-            span,
-        );
-        RevsetParseError {
-            kind,
-            pest_error: Some(Box::new(err)),
-            origin: Some(Box::new(origin)),
-        }
-    }
-
-    pub fn kind(&self) -> &RevsetParseErrorKind {
-        &self.kind
-    }
-
-    /// Original parsing error which typically occurred in an alias expression.
-    pub fn origin(&self) -> Option<&Self> {
-        self.origin.as_deref()
-    }
+/// Error occurred during revset evaluation.
+#[derive(Debug, Error)]
+pub enum RevsetEvaluationError {
+    #[error("Unexpected error from store")]
+    StoreError(#[source] BackendError),
+    #[error("{0}")]
+    Other(String),
 }
 
-impl From<pest::error::Error<Rule>> for RevsetParseError {
-    fn from(err: pest::error::Error<Rule>) -> Self {
-        RevsetParseError {
-            kind: RevsetParseErrorKind::SyntaxError,
-            pest_error: Some(Box::new(err)),
-            origin: None,
-        }
-    }
+// assumes index has less than u64::MAX entries.
+pub const GENERATION_RANGE_FULL: Range<u64> = 0..u64::MAX;
+pub const GENERATION_RANGE_EMPTY: Range<u64> = 0..0;
+
+/// Global flag applied to the entire expression.
+///
+/// The core revset engine doesn't use this value. It's up to caller to
+/// interpret it to change the evaluation behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RevsetModifier {
+    /// Expression can be evaluated to multiple revisions even if a single
+    /// revision is expected by default.
+    All,
 }
 
-impl fmt::Display for RevsetParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(err) = &self.pest_error {
-            err.fmt(f)
-        } else {
-            self.kind.fmt(f)
-        }
+/// Symbol or function to be resolved to `CommitId`s.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RevsetCommitRef {
+    WorkingCopy(WorkspaceId),
+    WorkingCopies,
+    Symbol(String),
+    RemoteSymbol {
+        name: String,
+        remote: String,
+    },
+    VisibleHeads,
+    Root,
+    Branches(StringPattern),
+    RemoteBranches {
+        branch_pattern: StringPattern,
+        remote_pattern: StringPattern,
+    },
+    Tags,
+    GitRefs,
+    GitHead,
+}
+
+/// A custom revset filter expression, defined by an extension.
+pub trait RevsetFilterExtension: std::fmt::Debug + Any {
+    fn as_any(&self) -> &dyn Any;
+
+    /// Returns true iff this filter matches the specified commit.
+    fn matches_commit(&self, commit: &Commit) -> bool;
+}
+
+// TODO: Refactor tests to not need the Eq trait so we can remove this wrapper.
+#[derive(Clone, Debug)]
+#[repr(transparent)]
+pub struct RevsetFilterExtensionWrapper(pub Rc<dyn RevsetFilterExtension>);
+
+impl PartialEq for RevsetFilterExtensionWrapper {
+    fn eq(&self, other: &RevsetFilterExtensionWrapper) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
     }
 }
 
-impl error::Error for RevsetParseError {
-    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        if let Some(e) = self.origin() {
-            return Some(e as &dyn error::Error);
-        }
-        match &self.kind {
-            // SyntaxError is a wrapper for pest::error::Error.
-            RevsetParseErrorKind::SyntaxError => {
-                self.pest_error.as_ref().map(|e| e as &dyn error::Error)
-            }
-            // Otherwise the kind represents this error.
-            e => e.source(),
-        }
-    }
-}
-
-// assumes index has less than u32::MAX entries.
-pub const GENERATION_RANGE_FULL: Range<u32> = 0..u32::MAX;
-pub const GENERATION_RANGE_EMPTY: Range<u32> = 0..0;
+impl Eq for RevsetFilterExtensionWrapper {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RevsetFilterPredicate {
     /// Commits with number of parents in the range.
     ParentCount(Range<u32>),
     /// Commits with description containing the needle.
-    Description(String),
+    Description(StringPattern),
     /// Commits with author's name or email containing the needle.
-    Author(String),
+    Author(StringPattern),
     /// Commits with committer's name or email containing the needle.
-    Committer(String),
-    /// Commits modifying the paths specified by the pattern.
-    File(Option<Vec<RepoPath>>), // TODO: embed matcher expression?
+    Committer(StringPattern),
+    /// Commits modifying the paths specified by the fileset.
+    File(FilesetExpression),
+    /// Commits with conflicts
+    HasConflict,
+    /// Custom predicates provided by extensions
+    Extension(RevsetFilterExtensionWrapper),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -203,35 +163,40 @@ pub enum RevsetExpression {
     None,
     All,
     Commits(Vec<CommitId>),
-    Symbol(String),
-    Children(Rc<RevsetExpression>),
+    CommitRef(RevsetCommitRef),
+    // TODO: This shouldn't be of RevsetExpression type. Maybe better to
+    // introduce an intermediate AST tree where aliases will be substituted.
+    StringPattern {
+        kind: String,
+        value: String,
+    },
     Ancestors {
         heads: Rc<RevsetExpression>,
-        generation: Range<u32>,
+        generation: Range<u64>,
+    },
+    Descendants {
+        roots: Rc<RevsetExpression>,
+        generation: Range<u64>,
     },
     // Commits that are ancestors of "heads" but not ancestors of "roots"
     Range {
         roots: Rc<RevsetExpression>,
         heads: Rc<RevsetExpression>,
-        generation: Range<u32>,
+        generation: Range<u64>,
     },
     // Commits that are descendants of "roots" and ancestors of "heads"
     DagRange {
         roots: Rc<RevsetExpression>,
         heads: Rc<RevsetExpression>,
+        // TODO: maybe add generation_from_roots/heads?
+    },
+    // Commits reachable from "sources" within "domain"
+    Reachable {
+        sources: Rc<RevsetExpression>,
+        domain: Rc<RevsetExpression>,
     },
     Heads(Rc<RevsetExpression>),
     Roots(Rc<RevsetExpression>),
-    VisibleHeads,
-    PublicHeads,
-    Branches(String),
-    RemoteBranches {
-        branch_needle: String,
-        remote_needle: String,
-    },
-    Tags,
-    GitRefs,
-    GitHead,
     Latest {
         candidates: Rc<RevsetExpression>,
         count: usize,
@@ -255,8 +220,23 @@ impl RevsetExpression {
         Rc::new(RevsetExpression::All)
     }
 
+    pub fn working_copy(workspace_id: WorkspaceId) -> Rc<RevsetExpression> {
+        Rc::new(RevsetExpression::CommitRef(RevsetCommitRef::WorkingCopy(
+            workspace_id,
+        )))
+    }
+
+    pub fn working_copies() -> Rc<RevsetExpression> {
+        Rc::new(RevsetExpression::CommitRef(RevsetCommitRef::WorkingCopies))
+    }
+
     pub fn symbol(value: String) -> Rc<RevsetExpression> {
-        Rc::new(RevsetExpression::Symbol(value))
+        Rc::new(RevsetExpression::CommitRef(RevsetCommitRef::Symbol(value)))
+    }
+
+    pub fn remote_symbol(name: String, remote: String) -> Rc<RevsetExpression> {
+        let commit_ref = RevsetCommitRef::RemoteSymbol { name, remote };
+        Rc::new(RevsetExpression::CommitRef(commit_ref))
     }
 
     pub fn commit(commit_id: CommitId) -> Rc<RevsetExpression> {
@@ -268,34 +248,41 @@ impl RevsetExpression {
     }
 
     pub fn visible_heads() -> Rc<RevsetExpression> {
-        Rc::new(RevsetExpression::VisibleHeads)
+        Rc::new(RevsetExpression::CommitRef(RevsetCommitRef::VisibleHeads))
     }
 
-    pub fn public_heads() -> Rc<RevsetExpression> {
-        Rc::new(RevsetExpression::PublicHeads)
+    pub fn root() -> Rc<RevsetExpression> {
+        Rc::new(RevsetExpression::CommitRef(RevsetCommitRef::Root))
     }
 
-    pub fn branches(needle: String) -> Rc<RevsetExpression> {
-        Rc::new(RevsetExpression::Branches(needle))
+    pub fn branches(pattern: StringPattern) -> Rc<RevsetExpression> {
+        Rc::new(RevsetExpression::CommitRef(RevsetCommitRef::Branches(
+            pattern,
+        )))
     }
 
-    pub fn remote_branches(branch_needle: String, remote_needle: String) -> Rc<RevsetExpression> {
-        Rc::new(RevsetExpression::RemoteBranches {
-            branch_needle,
-            remote_needle,
-        })
+    pub fn remote_branches(
+        branch_pattern: StringPattern,
+        remote_pattern: StringPattern,
+    ) -> Rc<RevsetExpression> {
+        Rc::new(RevsetExpression::CommitRef(
+            RevsetCommitRef::RemoteBranches {
+                branch_pattern,
+                remote_pattern,
+            },
+        ))
     }
 
     pub fn tags() -> Rc<RevsetExpression> {
-        Rc::new(RevsetExpression::Tags)
+        Rc::new(RevsetExpression::CommitRef(RevsetCommitRef::Tags))
     }
 
     pub fn git_refs() -> Rc<RevsetExpression> {
-        Rc::new(RevsetExpression::GitRefs)
+        Rc::new(RevsetExpression::CommitRef(RevsetCommitRef::GitRefs))
     }
 
     pub fn git_head() -> Rc<RevsetExpression> {
-        Rc::new(RevsetExpression::GitHead)
+        Rc::new(RevsetExpression::CommitRef(RevsetCommitRef::GitHead))
     }
 
     pub fn latest(self: &Rc<RevsetExpression>, count: usize) -> Rc<RevsetExpression> {
@@ -307,6 +294,11 @@ impl RevsetExpression {
 
     pub fn filter(predicate: RevsetFilterPredicate) -> Rc<RevsetExpression> {
         Rc::new(RevsetExpression::Filter(predicate))
+    }
+
+    /// Find any empty commits.
+    pub fn is_empty() -> Rc<RevsetExpression> {
+        Self::filter(RevsetFilterPredicate::File(FilesetExpression::all())).negated()
     }
 
     /// Commits in `self` that don't have descendants in `self`.
@@ -329,20 +321,49 @@ impl RevsetExpression {
 
     /// Ancestors of `self`, including `self`.
     pub fn ancestors(self: &Rc<RevsetExpression>) -> Rc<RevsetExpression> {
+        self.ancestors_range(GENERATION_RANGE_FULL)
+    }
+
+    /// Ancestors of `self` at an offset of `generation` behind `self`.
+    /// The `generation` offset is zero-based starting from `self`.
+    pub fn ancestors_at(self: &Rc<RevsetExpression>, generation: u64) -> Rc<RevsetExpression> {
+        self.ancestors_range(generation..(generation + 1))
+    }
+
+    /// Ancestors of `self` in the given range.
+    pub fn ancestors_range(
+        self: &Rc<RevsetExpression>,
+        generation_range: Range<u64>,
+    ) -> Rc<RevsetExpression> {
         Rc::new(RevsetExpression::Ancestors {
             heads: self.clone(),
-            generation: GENERATION_RANGE_FULL,
+            generation: generation_range,
         })
     }
 
     /// Children of `self`.
     pub fn children(self: &Rc<RevsetExpression>) -> Rc<RevsetExpression> {
-        Rc::new(RevsetExpression::Children(self.clone()))
+        Rc::new(RevsetExpression::Descendants {
+            roots: self.clone(),
+            generation: 1..2,
+        })
     }
 
     /// Descendants of `self`, including `self`.
     pub fn descendants(self: &Rc<RevsetExpression>) -> Rc<RevsetExpression> {
-        self.dag_range_to(&RevsetExpression::visible_heads())
+        Rc::new(RevsetExpression::Descendants {
+            roots: self.clone(),
+            generation: GENERATION_RANGE_FULL,
+        })
+    }
+
+    /// Descendants of `self` at an offset of `generation` ahead of `self`.
+    /// The `generation` offset is zero-based starting from `self`.
+    pub fn descendants_at(self: &Rc<RevsetExpression>, generation: u64) -> Rc<RevsetExpression> {
+        Rc::new(RevsetExpression::Descendants {
+            roots: self.clone(),
+            generation: generation..(generation + 1),
+        })
     }
 
     /// Commits that are descendants of `self` and ancestors of `heads`, both
@@ -361,6 +382,18 @@ impl RevsetExpression {
     /// between them.
     pub fn connected(self: &Rc<RevsetExpression>) -> Rc<RevsetExpression> {
         self.dag_range_to(self)
+    }
+
+    /// All commits within `domain` reachable from this set of commits, by
+    /// traversing either parent or child edges.
+    pub fn reachable(
+        self: &Rc<RevsetExpression>,
+        domain: &Rc<RevsetExpression>,
+    ) -> Rc<RevsetExpression> {
+        Rc::new(RevsetExpression::Reachable {
+            sources: self.clone(),
+            domain: domain.clone(),
+        })
     }
 
     /// Commits reachable from `heads` but not from `self`.
@@ -388,6 +421,19 @@ impl RevsetExpression {
         Rc::new(RevsetExpression::Union(self.clone(), other.clone()))
     }
 
+    /// Commits that are in any of the `expressions`.
+    pub fn union_all(expressions: &[Rc<RevsetExpression>]) -> Rc<RevsetExpression> {
+        match expressions {
+            [] => Self::none(),
+            [expression] => expression.clone(),
+            _ => {
+                // Build balanced tree to minimize the recursion depth.
+                let (left, right) = expressions.split_at(expressions.len() / 2);
+                Self::union(&Self::union_all(left), &Self::union_all(right))
+            }
+        }
+    }
+
     /// Commits that are in `self` and in `other`.
     pub fn intersection(
         self: &Rc<RevsetExpression>,
@@ -404,133 +450,143 @@ impl RevsetExpression {
         Rc::new(RevsetExpression::Difference(self.clone(), other.clone()))
     }
 
+    /// Resolve a programmatically created revset expression. In particular, the
+    /// expression must not contain any symbols (branches, tags, change/commit
+    /// prefixes). Callers must not include `RevsetExpression::symbol()` in
+    /// the expression, and should instead resolve symbols to `CommitId`s and
+    /// pass them into `RevsetExpression::commits()`. Similarly, the expression
+    /// must not contain any `RevsetExpression::remote_symbol()` or
+    /// `RevsetExpression::working_copy()`, unless they're known to be valid.
+    pub fn resolve_programmatic(self: Rc<Self>, repo: &dyn Repo) -> ResolvedExpression {
+        let symbol_resolver = FailingSymbolResolver;
+        resolve_symbols(repo, self, &symbol_resolver)
+            .map(|expression| resolve_visibility(repo, &expression))
+            .unwrap()
+    }
+
+    /// Resolve a user-provided expression. Symbols will be resolved using the
+    /// provided `SymbolResolver`.
+    pub fn resolve_user_expression(
+        self: Rc<Self>,
+        repo: &dyn Repo,
+        symbol_resolver: &dyn SymbolResolver,
+    ) -> Result<ResolvedExpression, RevsetResolutionError> {
+        resolve_symbols(repo, self, symbol_resolver)
+            .map(|expression| resolve_visibility(repo, &expression))
+    }
+
+    /// Resolve a programmatically created revset expression and evaluate it in
+    /// the repo.
+    pub fn evaluate_programmatic<'index>(
+        self: Rc<Self>,
+        repo: &'index dyn Repo,
+    ) -> Result<Box<dyn Revset + 'index>, RevsetEvaluationError> {
+        optimize(self).resolve_programmatic(repo).evaluate(repo)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolvedPredicateExpression {
+    /// Pure filter predicate.
+    Filter(RevsetFilterPredicate),
+    /// Set expression to be evaluated as filter. This is typically a subtree
+    /// node of `Union` with a pure filter predicate.
+    Set(Box<ResolvedExpression>),
+    NotIn(Box<ResolvedPredicateExpression>),
+    Union(
+        Box<ResolvedPredicateExpression>,
+        Box<ResolvedPredicateExpression>,
+    ),
+}
+
+/// Describes evaluation plan of revset expression.
+///
+/// Unlike `RevsetExpression`, this doesn't contain unresolved symbols or `View`
+/// properties.
+///
+/// Use `RevsetExpression` API to build a query programmatically.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ResolvedExpression {
+    Commits(Vec<CommitId>),
+    Ancestors {
+        heads: Box<ResolvedExpression>,
+        generation: Range<u64>,
+    },
+    /// Commits that are ancestors of `heads` but not ancestors of `roots`.
+    Range {
+        roots: Box<ResolvedExpression>,
+        heads: Box<ResolvedExpression>,
+        generation: Range<u64>,
+    },
+    /// Commits that are descendants of `roots` and ancestors of `heads`.
+    DagRange {
+        roots: Box<ResolvedExpression>,
+        heads: Box<ResolvedExpression>,
+        generation_from_roots: Range<u64>,
+    },
+    /// Commits reachable from `sources` within `domain`.
+    Reachable {
+        sources: Box<ResolvedExpression>,
+        domain: Box<ResolvedExpression>,
+    },
+    Heads(Box<ResolvedExpression>),
+    Roots(Box<ResolvedExpression>),
+    Latest {
+        candidates: Box<ResolvedExpression>,
+        count: usize,
+    },
+    Union(Box<ResolvedExpression>, Box<ResolvedExpression>),
+    /// Intersects `candidates` with `predicate` by filtering.
+    FilterWithin {
+        candidates: Box<ResolvedExpression>,
+        predicate: ResolvedPredicateExpression,
+    },
+    /// Intersects expressions by merging.
+    Intersection(Box<ResolvedExpression>, Box<ResolvedExpression>),
+    Difference(Box<ResolvedExpression>, Box<ResolvedExpression>),
+}
+
+impl ResolvedExpression {
     pub fn evaluate<'index>(
         &self,
         repo: &'index dyn Repo,
-    ) -> Result<Box<dyn Revset<'index> + 'index>, RevsetError> {
-        repo.index().evaluate_revset(repo, self)
+    ) -> Result<Box<dyn Revset + 'index>, RevsetEvaluationError> {
+        repo.index().evaluate_revset(self, repo.store())
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct RevsetAliasesMap {
-    symbol_aliases: HashMap<String, String>,
-    function_aliases: HashMap<String, (Vec<String>, String)>,
-}
-
-impl RevsetAliasesMap {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Adds new substitution rule `decl = defn`.
-    ///
-    /// Returns error if `decl` is invalid. The `defn` part isn't checked. A bad
-    /// `defn` will be reported when the alias is substituted.
-    pub fn insert(
-        &mut self,
-        decl: impl AsRef<str>,
-        defn: impl Into<String>,
-    ) -> Result<(), RevsetParseError> {
-        match RevsetAliasDeclaration::parse(decl.as_ref())? {
-            RevsetAliasDeclaration::Symbol(name) => {
-                self.symbol_aliases.insert(name, defn.into());
-            }
-            RevsetAliasDeclaration::Function(name, params) => {
-                self.function_aliases.insert(name, (params, defn.into()));
-            }
-        }
-        Ok(())
-    }
-
-    fn get_symbol<'a>(&'a self, name: &str) -> Option<(RevsetAliasId<'a>, &'a str)> {
-        self.symbol_aliases
-            .get_key_value(name)
-            .map(|(name, defn)| (RevsetAliasId::Symbol(name), defn.as_ref()))
-    }
-
-    fn get_function<'a>(
-        &'a self,
-        name: &str,
-    ) -> Option<(RevsetAliasId<'a>, &'a [String], &'a str)> {
-        self.function_aliases
-            .get_key_value(name)
-            .map(|(name, (params, defn))| {
-                (
-                    RevsetAliasId::Function(name),
-                    params.as_ref(),
-                    defn.as_ref(),
-                )
-            })
-    }
-}
-
-/// Parsed declaration part of alias rule.
-#[derive(Clone, Debug)]
-enum RevsetAliasDeclaration {
-    Symbol(String),
-    Function(String, Vec<String>),
-}
-
-impl RevsetAliasDeclaration {
-    fn parse(source: &str) -> Result<Self, RevsetParseError> {
-        let mut pairs = RevsetParser::parse(Rule::alias_declaration, source)?;
-        let first = pairs.next().unwrap();
-        match first.as_rule() {
-            Rule::identifier => Ok(RevsetAliasDeclaration::Symbol(first.as_str().to_owned())),
-            Rule::function_name => {
-                let name = first.as_str().to_owned();
-                let params_pair = pairs.next().unwrap();
-                let params_span = params_pair.as_span();
-                let params = params_pair
-                    .into_inner()
-                    .map(|pair| match pair.as_rule() {
-                        Rule::identifier => pair.as_str().to_owned(),
-                        r => panic!("unexpected formal parameter rule {r:?}"),
-                    })
-                    .collect_vec();
-                if params.iter().all_unique() {
-                    Ok(RevsetAliasDeclaration::Function(name, params))
-                } else {
-                    Err(RevsetParseError::with_span(
-                        RevsetParseErrorKind::RedefinedFunctionParameter,
-                        params_span,
-                    ))
-                }
-            }
-            r => panic!("unexpected alias declaration rule {r:?}"),
-        }
-    }
-}
-
-/// Borrowed reference to identify alias expression.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum RevsetAliasId<'a> {
-    Symbol(&'a str),
-    Function(&'a str),
-}
-
-impl fmt::Display for RevsetAliasId<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RevsetAliasId::Symbol(name) => write!(f, "{name}"),
-            RevsetAliasId::Function(name) => write!(f, "{name}()"),
-        }
-    }
-}
-
+// TODO: split to parsing and name resolution parts and remove pub(super)
 #[derive(Clone, Copy, Debug)]
-struct ParseState<'a> {
-    aliases_map: &'a RevsetAliasesMap,
-    aliases_expanding: &'a [RevsetAliasId<'a>],
-    locals: &'a HashMap<&'a str, Rc<RevsetExpression>>,
-    workspace_ctx: Option<&'a RevsetWorkspaceContext<'a>>,
+pub struct ParseState<'a> {
+    pub(super) function_map: &'a HashMap<&'static str, RevsetFunction>,
+    pub(super) aliases_map: &'a RevsetAliasesMap,
+    aliases_expanding: &'a [AliasId<'a>],
+    pub(super) locals: &'a HashMap<&'a str, Rc<RevsetExpression>>,
+    user_email: &'a str,
+    pub(super) workspace_ctx: &'a Option<RevsetWorkspaceContext<'a>>,
+    /// Whether or not `kind:"pattern"` syntax is allowed.
+    pub(super) allow_string_pattern: bool,
 }
 
-impl ParseState<'_> {
-    fn with_alias_expanding<T>(
+impl<'a> ParseState<'a> {
+    fn new(
+        context: &'a RevsetParseContext,
+        locals: &'a HashMap<&str, Rc<RevsetExpression>>,
+    ) -> Self {
+        ParseState {
+            function_map: &context.extensions.function_map,
+            aliases_map: context.aliases_map,
+            aliases_expanding: &[],
+            locals,
+            user_email: &context.user_email,
+            workspace_ctx: &context.workspace,
+            allow_string_pattern: false,
+        }
+    }
+
+    pub(super) fn with_alias_expanding<T>(
         self,
-        id: RevsetAliasId<'_>,
+        id: AliasId<'_>,
         locals: &HashMap<&str, Rc<RevsetExpression>>,
         span: pest::Span<'_>,
         f: impl FnOnce(ParseState<'_>) -> Result<T, RevsetParseError>,
@@ -545,211 +601,25 @@ impl ParseState<'_> {
         let mut aliases_expanding = self.aliases_expanding.to_vec();
         aliases_expanding.push(id);
         let expanding_state = ParseState {
+            function_map: self.function_map,
             aliases_map: self.aliases_map,
             aliases_expanding: &aliases_expanding,
             locals,
+            user_email: self.user_email,
             workspace_ctx: self.workspace_ctx,
+            allow_string_pattern: self.allow_string_pattern,
         };
         f(expanding_state).map_err(|e| {
-            RevsetParseError::with_span_and_origin(
+            RevsetParseError::with_span(
                 RevsetParseErrorKind::BadAliasExpansion(id.to_string()),
                 span,
-                e,
             )
+            .with_source(e)
         })
     }
 }
 
-fn parse_program(
-    revset_str: &str,
-    state: ParseState,
-) -> Result<Rc<RevsetExpression>, RevsetParseError> {
-    let mut pairs = RevsetParser::parse(Rule::program, revset_str)?;
-    let first = pairs.next().unwrap();
-    parse_expression_rule(first.into_inner(), state)
-}
-
-fn parse_expression_rule(
-    pairs: Pairs<Rule>,
-    state: ParseState,
-) -> Result<Rc<RevsetExpression>, RevsetParseError> {
-    fn not_postfix_op(
-        op: &Pair<Rule>,
-        similar_op: impl Into<String>,
-        description: impl Into<String>,
-    ) -> RevsetParseError {
-        RevsetParseError::with_span(
-            RevsetParseErrorKind::NotPostfixOperator {
-                op: op.as_str().to_owned(),
-                similar_op: similar_op.into(),
-                description: description.into(),
-            },
-            op.as_span(),
-        )
-    }
-
-    fn not_infix_op(
-        op: &Pair<Rule>,
-        similar_op: impl Into<String>,
-        description: impl Into<String>,
-    ) -> RevsetParseError {
-        RevsetParseError::with_span(
-            RevsetParseErrorKind::NotInfixOperator {
-                op: op.as_str().to_owned(),
-                similar_op: similar_op.into(),
-                description: description.into(),
-            },
-            op.as_span(),
-        )
-    }
-
-    static PRATT: Lazy<PrattParser<Rule>> = Lazy::new(|| {
-        PrattParser::new()
-            .op(Op::infix(Rule::union_op, Assoc::Left)
-                | Op::infix(Rule::compat_add_op, Assoc::Left))
-            .op(Op::infix(Rule::intersection_op, Assoc::Left)
-                | Op::infix(Rule::difference_op, Assoc::Left)
-                | Op::infix(Rule::compat_sub_op, Assoc::Left))
-            .op(Op::prefix(Rule::negate_op))
-            // Ranges can't be nested without parentheses. Associativity doesn't matter.
-            .op(Op::infix(Rule::dag_range_op, Assoc::Left) | Op::infix(Rule::range_op, Assoc::Left))
-            .op(Op::prefix(Rule::dag_range_pre_op) | Op::prefix(Rule::range_pre_op))
-            .op(Op::postfix(Rule::dag_range_post_op) | Op::postfix(Rule::range_post_op))
-            // Neighbors
-            .op(Op::postfix(Rule::parents_op)
-                | Op::postfix(Rule::children_op)
-                | Op::postfix(Rule::compat_parents_op))
-    });
-    PRATT
-        .map_primary(|primary| parse_primary_rule(primary, state))
-        .map_prefix(|op, rhs| match op.as_rule() {
-            Rule::negate_op => Ok(rhs?.negated()),
-            Rule::dag_range_pre_op | Rule::range_pre_op => Ok(rhs?.ancestors()),
-            r => panic!("unexpected prefix operator rule {r:?}"),
-        })
-        .map_postfix(|lhs, op| match op.as_rule() {
-            Rule::dag_range_post_op => Ok(lhs?.descendants()),
-            Rule::range_post_op => Ok(lhs?.range(&RevsetExpression::visible_heads())),
-            Rule::parents_op => Ok(lhs?.parents()),
-            Rule::children_op => Ok(lhs?.children()),
-            Rule::compat_parents_op => Err(not_postfix_op(&op, "-", "parents")),
-            r => panic!("unexpected postfix operator rule {r:?}"),
-        })
-        .map_infix(|lhs, op, rhs| match op.as_rule() {
-            Rule::union_op => Ok(lhs?.union(&rhs?)),
-            Rule::compat_add_op => Err(not_infix_op(&op, "|", "union")),
-            Rule::intersection_op => Ok(lhs?.intersection(&rhs?)),
-            Rule::difference_op => Ok(lhs?.minus(&rhs?)),
-            Rule::compat_sub_op => Err(not_infix_op(&op, "~", "difference")),
-            Rule::dag_range_op => Ok(lhs?.dag_range_to(&rhs?)),
-            Rule::range_op => Ok(lhs?.range(&rhs?)),
-            r => panic!("unexpected infix operator rule {r:?}"),
-        })
-        .parse(pairs)
-}
-
-fn parse_primary_rule(
-    pair: Pair<Rule>,
-    state: ParseState,
-) -> Result<Rc<RevsetExpression>, RevsetParseError> {
-    let span = pair.as_span();
-    let mut pairs = pair.into_inner();
-    let first = pairs.next().unwrap();
-    match first.as_rule() {
-        Rule::expression => parse_expression_rule(first.into_inner(), state),
-        Rule::function_name => {
-            let arguments_pair = pairs.next().unwrap();
-            parse_function_expression(first, arguments_pair, state, span)
-        }
-        Rule::symbol => parse_symbol_rule(first.into_inner(), state),
-        _ => {
-            panic!("unexpected revset parse rule: {:?}", first.as_str());
-        }
-    }
-}
-
-fn parse_symbol_rule(
-    mut pairs: Pairs<Rule>,
-    state: ParseState,
-) -> Result<Rc<RevsetExpression>, RevsetParseError> {
-    let first = pairs.next().unwrap();
-    match first.as_rule() {
-        Rule::identifier => {
-            let name = first.as_str();
-            if let Some(expr) = state.locals.get(name) {
-                Ok(expr.clone())
-            } else if let Some((id, defn)) = state.aliases_map.get_symbol(name) {
-                let locals = HashMap::new(); // Don't spill out the current scope
-                state.with_alias_expanding(id, &locals, first.as_span(), |state| {
-                    parse_program(defn, state)
-                })
-            } else {
-                Ok(RevsetExpression::symbol(name.to_owned()))
-            }
-        }
-        Rule::literal_string => {
-            return Ok(RevsetExpression::symbol(
-                first
-                    .as_str()
-                    .strip_prefix('"')
-                    .unwrap()
-                    .strip_suffix('"')
-                    .unwrap()
-                    .to_owned(),
-            ));
-        }
-        _ => {
-            panic!("unexpected symbol parse rule: {:?}", first.as_str());
-        }
-    }
-}
-
-fn parse_function_expression(
-    name_pair: Pair<Rule>,
-    arguments_pair: Pair<Rule>,
-    state: ParseState,
-    primary_span: pest::Span<'_>,
-) -> Result<Rc<RevsetExpression>, RevsetParseError> {
-    let name = name_pair.as_str();
-    if let Some((id, params, defn)) = state.aliases_map.get_function(name) {
-        // Resolve arguments in the current scope, and pass them in to the alias
-        // expansion scope.
-        let (required, optional) =
-            expect_named_arguments_vec(name, &[], arguments_pair, params.len(), params.len())?;
-        assert!(optional.is_empty());
-        let args: Vec<_> = required
-            .into_iter()
-            .map(|arg| parse_expression_rule(arg.into_inner(), state))
-            .try_collect()?;
-        let locals = params.iter().map(|s| s.as_str()).zip(args).collect();
-        state.with_alias_expanding(id, &locals, primary_span, |state| {
-            parse_program(defn, state)
-        })
-    } else if let Some(func) = BUILTIN_FUNCTION_MAP.get(name) {
-        func(name, arguments_pair, state)
-    } else {
-        Err(RevsetParseError::with_span(
-            RevsetParseErrorKind::NoSuchFunction {
-                name: name.to_owned(),
-                candidates: collect_function_names(state.aliases_map),
-            },
-            name_pair.as_span(),
-        ))
-    }
-}
-
-fn collect_function_names(aliases_map: &RevsetAliasesMap) -> Vec<String> {
-    let mut names = BUILTIN_FUNCTION_MAP
-        .keys()
-        .map(|&n| n.to_owned())
-        .collect_vec();
-    names.extend(aliases_map.function_aliases.keys().map(|n| n.to_owned()));
-    names.sort_unstable();
-    names.dedup();
-    names
-}
-
-type RevsetFunction =
+pub type RevsetFunction =
     fn(&str, Pair<Rule>, ParseState) -> Result<Rc<RevsetExpression>, RevsetParseError>;
 
 static BUILTIN_FUNCTION_MAP: Lazy<HashMap<&'static str, RevsetFunction>> = Lazy::new(|| {
@@ -767,9 +637,15 @@ static BUILTIN_FUNCTION_MAP: Lazy<HashMap<&'static str, RevsetFunction>> = Lazy:
         Ok(expression.children())
     });
     map.insert("ancestors", |name, arguments_pair, state| {
-        let arg = expect_one_argument(name, arguments_pair)?;
-        let expression = parse_expression_rule(arg.into_inner(), state)?;
-        Ok(expression.ancestors())
+        let ([heads_arg], [depth_opt_arg]) = expect_arguments(name, arguments_pair)?;
+        let heads = parse_expression_rule(heads_arg.into_inner(), state)?;
+        let generation = if let Some(depth_arg) = depth_opt_arg {
+            let depth = parse_function_argument_as_literal("integer", name, depth_arg, state)?;
+            0..depth
+        } else {
+            GENERATION_RANGE_FULL
+        };
+        Ok(heads.ancestors_range(generation))
     });
     map.insert("descendants", |name, arguments_pair, state| {
         let arg = expect_one_argument(name, arguments_pair)?;
@@ -781,6 +657,12 @@ static BUILTIN_FUNCTION_MAP: Lazy<HashMap<&'static str, RevsetFunction>> = Lazy:
         let candidates = parse_expression_rule(arg.into_inner(), state)?;
         Ok(candidates.connected())
     });
+    map.insert("reachable", |name, arguments_pair, state| {
+        let ([source_arg, domain_arg], []) = expect_arguments(name, arguments_pair)?;
+        let sources = parse_expression_rule(source_arg.into_inner(), state)?;
+        let domain = parse_expression_rule(domain_arg.into_inner(), state)?;
+        Ok(sources.reachable(&domain))
+    });
     map.insert("none", |name, arguments_pair, _state| {
         expect_no_arguments(name, arguments_pair)?;
         Ok(RevsetExpression::none())
@@ -789,49 +671,53 @@ static BUILTIN_FUNCTION_MAP: Lazy<HashMap<&'static str, RevsetFunction>> = Lazy:
         expect_no_arguments(name, arguments_pair)?;
         Ok(RevsetExpression::all())
     });
+    map.insert("working_copies", |name, arguments_pair, _state| {
+        expect_no_arguments(name, arguments_pair)?;
+        Ok(RevsetExpression::working_copies())
+    });
     map.insert("heads", |name, arguments_pair, state| {
-        let ([], [opt_arg]) = expect_arguments(name, arguments_pair)?;
-        if let Some(arg) = opt_arg {
-            let candidates = parse_expression_rule(arg.into_inner(), state)?;
-            Ok(candidates.heads())
-        } else {
-            Ok(RevsetExpression::visible_heads())
-        }
+        let arg = expect_one_argument(name, arguments_pair)?;
+        let candidates = parse_expression_rule(arg.into_inner(), state)?;
+        Ok(candidates.heads())
     });
     map.insert("roots", |name, arguments_pair, state| {
         let arg = expect_one_argument(name, arguments_pair)?;
         let candidates = parse_expression_rule(arg.into_inner(), state)?;
         Ok(candidates.roots())
     });
-    map.insert("public_heads", |name, arguments_pair, _state| {
+    map.insert("visible_heads", |name, arguments_pair, _state| {
         expect_no_arguments(name, arguments_pair)?;
-        Ok(RevsetExpression::public_heads())
+        Ok(RevsetExpression::visible_heads())
+    });
+    map.insert("root", |name, arguments_pair, _state| {
+        expect_no_arguments(name, arguments_pair)?;
+        Ok(RevsetExpression::root())
     });
     map.insert("branches", |name, arguments_pair, state| {
         let ([], [opt_arg]) = expect_arguments(name, arguments_pair)?;
-        let needle = if let Some(arg) = opt_arg {
-            parse_function_argument_to_string(name, arg, state)?
+        let pattern = if let Some(arg) = opt_arg {
+            parse_function_argument_to_string_pattern(name, arg, state)?
         } else {
-            "".to_owned()
+            StringPattern::everything()
         };
-        Ok(RevsetExpression::branches(needle))
+        Ok(RevsetExpression::branches(pattern))
     });
     map.insert("remote_branches", |name, arguments_pair, state| {
         let ([], [branch_opt_arg, remote_opt_arg]) =
             expect_named_arguments(name, &["", "remote"], arguments_pair)?;
-        let branch_needle = if let Some(branch_arg) = branch_opt_arg {
-            parse_function_argument_to_string(name, branch_arg, state)?
+        let branch_pattern = if let Some(branch_arg) = branch_opt_arg {
+            parse_function_argument_to_string_pattern(name, branch_arg, state)?
         } else {
-            "".to_owned()
+            StringPattern::everything()
         };
-        let remote_needle = if let Some(remote_arg) = remote_opt_arg {
-            parse_function_argument_to_string(name, remote_arg, state)?
+        let remote_pattern = if let Some(remote_arg) = remote_opt_arg {
+            parse_function_argument_to_string_pattern(name, remote_arg, state)?
         } else {
-            "".to_owned()
+            StringPattern::everything()
         };
         Ok(RevsetExpression::remote_branches(
-            branch_needle,
-            remote_needle,
+            branch_pattern,
+            remote_pattern,
         ))
     });
     map.insert("tags", |name, arguments_pair, _state| {
@@ -864,65 +750,67 @@ static BUILTIN_FUNCTION_MAP: Lazy<HashMap<&'static str, RevsetFunction>> = Lazy:
     });
     map.insert("description", |name, arguments_pair, state| {
         let arg = expect_one_argument(name, arguments_pair)?;
-        let needle = parse_function_argument_to_string(name, arg, state)?;
+        let pattern = parse_function_argument_to_string_pattern(name, arg, state)?;
         Ok(RevsetExpression::filter(
-            RevsetFilterPredicate::Description(needle),
+            RevsetFilterPredicate::Description(pattern),
         ))
     });
     map.insert("author", |name, arguments_pair, state| {
         let arg = expect_one_argument(name, arguments_pair)?;
-        let needle = parse_function_argument_to_string(name, arg, state)?;
+        let pattern = parse_function_argument_to_string_pattern(name, arg, state)?;
         Ok(RevsetExpression::filter(RevsetFilterPredicate::Author(
-            needle,
+            pattern,
+        )))
+    });
+    map.insert("mine", |name, arguments_pair, state| {
+        expect_no_arguments(name, arguments_pair)?;
+        Ok(RevsetExpression::filter(RevsetFilterPredicate::Author(
+            StringPattern::Exact(state.user_email.to_owned()),
         )))
     });
     map.insert("committer", |name, arguments_pair, state| {
         let arg = expect_one_argument(name, arguments_pair)?;
-        let needle = parse_function_argument_to_string(name, arg, state)?;
+        let pattern = parse_function_argument_to_string_pattern(name, arg, state)?;
         Ok(RevsetExpression::filter(RevsetFilterPredicate::Committer(
-            needle,
+            pattern,
         )))
     });
     map.insert("empty", |name, arguments_pair, _state| {
         expect_no_arguments(name, arguments_pair)?;
-        Ok(RevsetExpression::filter(RevsetFilterPredicate::File(None)).negated())
+        Ok(RevsetExpression::is_empty())
     });
     map.insert("file", |name, arguments_pair, state| {
+        let arguments_span = arguments_pair.as_span();
         if let Some(ctx) = state.workspace_ctx {
-            let arguments_span = arguments_pair.as_span();
-            let paths: Vec<_> = arguments_pair
+            let ctx = FilesetParseContext {
+                cwd: ctx.cwd,
+                workspace_root: ctx.workspace_root,
+            };
+            let file_expressions: Vec<_> = arguments_pair
                 .into_inner()
-                .map(|arg| -> Result<_, RevsetParseError> {
-                    let span = arg.as_span();
-                    let needle = parse_function_argument_to_string(name, arg, state)?;
-                    let path = RepoPath::parse_fs_path(ctx.cwd, ctx.workspace_root, &needle)
-                        .map_err(|e| {
-                            RevsetParseError::with_span(
-                                RevsetParseErrorKind::FsPathParseError(e),
-                                span,
-                            )
-                        })?;
-                    Ok(path)
-                })
+                .map(|arg| parse_function_argument_to_file_pattern(name, arg, state, &ctx))
+                .map_ok(FilesetExpression::pattern)
                 .try_collect()?;
-            if paths.is_empty() {
-                Err(RevsetParseError::with_span(
-                    RevsetParseErrorKind::InvalidFunctionArguments {
-                        name: name.to_owned(),
-                        message: "Expected at least 1 argument".to_string(),
-                    },
+            if file_expressions.is_empty() {
+                Err(RevsetParseError::invalid_arguments(
+                    name,
+                    "Expected at least 1 argument",
                     arguments_span,
                 ))
             } else {
-                Ok(RevsetExpression::filter(RevsetFilterPredicate::File(Some(
-                    paths,
-                ))))
+                let expr = FilesetExpression::union_all(file_expressions);
+                Ok(RevsetExpression::filter(RevsetFilterPredicate::File(expr)))
             }
         } else {
-            Err(RevsetParseError::new(
+            Err(RevsetParseError::with_span(
                 RevsetParseErrorKind::FsPathWithoutWorkspace,
+                arguments_span,
             ))
         }
+    });
+    map.insert("conflict", |name, arguments_pair, _state| {
+        expect_no_arguments(name, arguments_pair)?;
+        Ok(RevsetExpression::filter(RevsetFilterPredicate::HasConflict))
     });
     map.insert("present", |name, arguments_pair, state| {
         let arg = expect_one_argument(name, arguments_pair)?;
@@ -932,137 +820,64 @@ static BUILTIN_FUNCTION_MAP: Lazy<HashMap<&'static str, RevsetFunction>> = Lazy:
     map
 });
 
-type OptionalArg<'i> = Option<Pair<'i, Rule>>;
-
-fn expect_no_arguments(
-    function_name: &str,
-    arguments_pair: Pair<Rule>,
-) -> Result<(), RevsetParseError> {
-    let ([], []) = expect_arguments(function_name, arguments_pair)?;
-    Ok(())
-}
-
-fn expect_one_argument<'i>(
-    function_name: &str,
-    arguments_pair: Pair<'i, Rule>,
-) -> Result<Pair<'i, Rule>, RevsetParseError> {
-    let ([arg], []) = expect_arguments(function_name, arguments_pair)?;
-    Ok(arg)
-}
-
-fn expect_arguments<'i, const N: usize, const M: usize>(
-    function_name: &str,
-    arguments_pair: Pair<'i, Rule>,
-) -> Result<([Pair<'i, Rule>; N], [OptionalArg<'i>; M]), RevsetParseError> {
-    expect_named_arguments(function_name, &[], arguments_pair)
-}
-
-/// Extracts N required arguments and M optional arguments.
-///
-/// `argument_names` is a list of argument names. Unnamed positional arguments
-/// should be padded with `""`.
-fn expect_named_arguments<'i, const N: usize, const M: usize>(
-    function_name: &str,
-    argument_names: &[&str],
-    arguments_pair: Pair<'i, Rule>,
-) -> Result<([Pair<'i, Rule>; N], [OptionalArg<'i>; M]), RevsetParseError> {
-    let (required, optional) =
-        expect_named_arguments_vec(function_name, argument_names, arguments_pair, N, N + M)?;
-    Ok((required.try_into().unwrap(), optional.try_into().unwrap()))
-}
-
-fn expect_named_arguments_vec<'i>(
-    function_name: &str,
-    argument_names: &[&str],
-    arguments_pair: Pair<'i, Rule>,
-    min_arg_count: usize,
-    max_arg_count: usize,
-) -> Result<(Vec<Pair<'i, Rule>>, Vec<OptionalArg<'i>>), RevsetParseError> {
-    assert!(argument_names.len() <= max_arg_count);
-    let arguments_span = arguments_pair.as_span();
-    let make_error = |message, span| {
-        RevsetParseError::with_span(
-            RevsetParseErrorKind::InvalidFunctionArguments {
-                name: function_name.to_owned(),
-                message,
-            },
-            span,
-        )
-    };
-    let make_count_error = || {
-        let message = if min_arg_count == max_arg_count {
-            format!("Expected {min_arg_count} arguments")
-        } else {
-            format!("Expected {min_arg_count} to {max_arg_count} arguments")
-        };
-        make_error(message, arguments_span)
-    };
-
-    let mut pos_iter = Some(0..max_arg_count);
-    let mut extracted_pairs = vec![None; max_arg_count];
-    for pair in arguments_pair.into_inner() {
-        let span = pair.as_span();
-        match pair.as_rule() {
-            Rule::expression => {
-                let pos = pos_iter
-                    .as_mut()
-                    .ok_or_else(|| {
-                        make_error(
-                            "Positional argument follows keyword argument".to_owned(),
-                            span,
-                        )
-                    })?
-                    .next()
-                    .ok_or_else(make_count_error)?;
-                assert!(extracted_pairs[pos].is_none());
-                extracted_pairs[pos] = Some(pair);
-            }
-            Rule::keyword_argument => {
-                pos_iter = None; // No more positional arguments
-                let mut pairs = pair.into_inner();
-                let name = pairs.next().unwrap();
-                let expr = pairs.next().unwrap();
-                assert_eq!(name.as_rule(), Rule::identifier);
-                assert_eq!(expr.as_rule(), Rule::expression);
-                let pos = argument_names
-                    .iter()
-                    .position(|&n| n == name.as_str())
-                    .ok_or_else(|| {
-                        make_error(
-                            format!(r#"Unexpected keyword argument "{}""#, name.as_str()),
-                            span,
-                        )
-                    })?;
-                if extracted_pairs[pos].is_some() {
-                    return Err(make_error(
-                        format!(r#"Got multiple values for keyword "{}""#, name.as_str()),
-                        span,
-                    ));
-                }
-                extracted_pairs[pos] = Some(expr);
-            }
-            r => panic!("unexpected argument rule {r:?}"),
-        }
-    }
-
-    assert_eq!(extracted_pairs.len(), max_arg_count);
-    let optional = extracted_pairs.split_off(min_arg_count);
-    let required = extracted_pairs.into_iter().flatten().collect_vec();
-    if required.len() != min_arg_count {
-        return Err(make_count_error());
-    }
-    Ok((required, optional))
-}
-
-fn parse_function_argument_to_string(
+pub fn parse_function_argument_to_file_pattern(
     name: &str,
     pair: Pair<Rule>,
     state: ParseState,
-) -> Result<String, RevsetParseError> {
-    parse_function_argument_as_literal("string", name, pair, state)
+    ctx: &FilesetParseContext,
+) -> Result<FilePattern, RevsetParseError> {
+    let parse_pattern = |value: &str, kind: Option<&str>| match kind {
+        Some(kind) => FilePattern::from_str_kind(ctx, value, kind),
+        None => FilePattern::cwd_prefix_path(ctx, value),
+    };
+    parse_function_argument_as_pattern("file pattern", name, pair, state, parse_pattern)
 }
 
-fn parse_function_argument_as_literal<T: FromStr>(
+pub fn parse_function_argument_to_string_pattern(
+    name: &str,
+    pair: Pair<Rule>,
+    state: ParseState,
+) -> Result<StringPattern, RevsetParseError> {
+    let parse_pattern = |value: &str, kind: Option<&str>| match kind {
+        Some(kind) => StringPattern::from_str_kind(value, kind),
+        None => Ok(StringPattern::Substring(value.to_owned())),
+    };
+    parse_function_argument_as_pattern("string pattern", name, pair, state, parse_pattern)
+}
+
+fn parse_function_argument_as_pattern<T, E: Into<Box<dyn error::Error + Send + Sync>>>(
+    type_name: &str,
+    function_name: &str,
+    pair: Pair<Rule>,
+    state: ParseState,
+    parse_pattern: impl FnOnce(&str, Option<&str>) -> Result<T, E>,
+) -> Result<T, RevsetParseError> {
+    let span = pair.as_span();
+    let wrap_error = |err: E| {
+        RevsetParseError::invalid_arguments(function_name, format!("Invalid {type_name}"), span)
+            .with_source(err)
+    };
+    let expression = {
+        let mut inner_state = state;
+        inner_state.allow_string_pattern = true;
+        parse_expression_rule(pair.into_inner(), inner_state)?
+    };
+    match expression.as_ref() {
+        RevsetExpression::CommitRef(RevsetCommitRef::Symbol(symbol)) => {
+            parse_pattern(symbol, None).map_err(wrap_error)
+        }
+        RevsetExpression::StringPattern { kind, value } => {
+            parse_pattern(value, Some(kind)).map_err(wrap_error)
+        }
+        _ => Err(RevsetParseError::invalid_arguments(
+            function_name,
+            format!("Expected function argument of {type_name}"),
+            span,
+        )),
+    }
+}
+
+pub fn parse_function_argument_as_literal<T: FromStr>(
     type_name: &str,
     name: &str,
     pair: Pair<Rule>,
@@ -1070,131 +885,148 @@ fn parse_function_argument_as_literal<T: FromStr>(
 ) -> Result<T, RevsetParseError> {
     let span = pair.as_span();
     let make_error = || {
-        RevsetParseError::with_span(
-            RevsetParseErrorKind::InvalidFunctionArguments {
-                name: name.to_string(),
-                message: format!("Expected function argument of type {type_name}"),
-            },
+        RevsetParseError::invalid_arguments(
+            name,
+            format!("Expected function argument of type {type_name}"),
             span,
         )
     };
-    let expression = parse_expression_rule(pair.into_inner(), state)?;
+    let expression = {
+        // Don't suggest :: operator for :, which is invalid in this context.
+        let mut inner_state = state;
+        inner_state.allow_string_pattern = true;
+        parse_expression_rule(pair.into_inner(), inner_state)?
+    };
     match expression.as_ref() {
-        RevsetExpression::Symbol(symbol) => symbol.parse().map_err(|_| make_error()),
+        RevsetExpression::CommitRef(RevsetCommitRef::Symbol(symbol)) => {
+            symbol.parse().map_err(|_| make_error())
+        }
         _ => Err(make_error()),
     }
 }
 
 pub fn parse(
     revset_str: &str,
-    aliases_map: &RevsetAliasesMap,
-    workspace_ctx: Option<&RevsetWorkspaceContext>,
+    context: &RevsetParseContext,
 ) -> Result<Rc<RevsetExpression>, RevsetParseError> {
-    let state = ParseState {
-        aliases_map,
-        aliases_expanding: &[],
-        locals: &HashMap::new(),
-        workspace_ctx,
-    };
+    let locals = HashMap::new();
+    let state = ParseState::new(context, &locals);
     parse_program(revset_str, state)
 }
 
-fn transform_expression_bottom_up(
-    expression: &Rc<RevsetExpression>,
-    mut f: impl FnMut(&Rc<RevsetExpression>) -> Option<Rc<RevsetExpression>>,
-) -> Option<Rc<RevsetExpression>> {
-    try_transform_expression_bottom_up(expression, |expression| Ok(f(expression))).unwrap()
+pub fn parse_with_modifier(
+    revset_str: &str,
+    context: &RevsetParseContext,
+) -> Result<(Rc<RevsetExpression>, Option<RevsetModifier>), RevsetParseError> {
+    let locals = HashMap::new();
+    let state = ParseState::new(context, &locals);
+    parse_program_with_modifier(revset_str, state)
 }
 
-type TransformResult = Result<Option<Rc<RevsetExpression>>, RevsetError>;
+/// `Some` for rewritten expression, or `None` to reuse the original expression.
+type TransformedExpression = Option<Rc<RevsetExpression>>;
+
 /// Walks `expression` tree and applies `f` recursively from leaf nodes.
-///
-/// If `f` returns `None`, the original expression node is reused. If no nodes
-/// rewritten, returns `None`. `std::iter::successors()` could be used if
-/// the transformation needs to be applied repeatedly until converged.
-fn try_transform_expression_bottom_up(
+fn transform_expression_bottom_up(
     expression: &Rc<RevsetExpression>,
-    mut f: impl FnMut(&Rc<RevsetExpression>) -> TransformResult,
-) -> TransformResult {
-    fn transform_child_rec(
+    mut f: impl FnMut(&Rc<RevsetExpression>) -> TransformedExpression,
+) -> TransformedExpression {
+    try_transform_expression::<Infallible>(expression, |_| Ok(None), |expression| Ok(f(expression)))
+        .unwrap()
+}
+
+/// Walks `expression` tree and applies transformation recursively.
+///
+/// `pre` is the callback to rewrite subtree including children. It is
+/// invoked before visiting the child nodes. If returned `Some`, children
+/// won't be visited.
+///
+/// `post` is the callback to rewrite from leaf nodes. If returned `None`,
+/// the original expression node will be reused.
+///
+/// If no nodes rewritten, this function returns `None`.
+/// `std::iter::successors()` could be used if the transformation needs to be
+/// applied repeatedly until converged.
+fn try_transform_expression<E>(
+    expression: &Rc<RevsetExpression>,
+    mut pre: impl FnMut(&Rc<RevsetExpression>) -> Result<TransformedExpression, E>,
+    mut post: impl FnMut(&Rc<RevsetExpression>) -> Result<TransformedExpression, E>,
+) -> Result<TransformedExpression, E> {
+    fn transform_child_rec<E>(
         expression: &Rc<RevsetExpression>,
-        f: &mut impl FnMut(&Rc<RevsetExpression>) -> TransformResult,
-    ) -> TransformResult {
+        pre: &mut impl FnMut(&Rc<RevsetExpression>) -> Result<TransformedExpression, E>,
+        post: &mut impl FnMut(&Rc<RevsetExpression>) -> Result<TransformedExpression, E>,
+    ) -> Result<TransformedExpression, E> {
         Ok(match expression.as_ref() {
             RevsetExpression::None => None,
             RevsetExpression::All => None,
             RevsetExpression::Commits(_) => None,
-            RevsetExpression::Symbol(_) => None,
-            RevsetExpression::Children(roots) => {
-                transform_rec(roots, f)?.map(RevsetExpression::Children)
-            }
-            RevsetExpression::Ancestors { heads, generation } => {
-                transform_rec(heads, f)?.map(|heads| RevsetExpression::Ancestors {
+            RevsetExpression::CommitRef(_) => None,
+            RevsetExpression::StringPattern { .. } => None,
+            RevsetExpression::Ancestors { heads, generation } => transform_rec(heads, pre, post)?
+                .map(|heads| RevsetExpression::Ancestors {
                     heads,
                     generation: generation.clone(),
-                })
-            }
+                }),
+            RevsetExpression::Descendants { roots, generation } => transform_rec(roots, pre, post)?
+                .map(|roots| RevsetExpression::Descendants {
+                    roots,
+                    generation: generation.clone(),
+                }),
             RevsetExpression::Range {
                 roots,
                 heads,
                 generation,
-            } => transform_rec_pair((roots, heads), f)?.map(|(roots, heads)| {
+            } => transform_rec_pair((roots, heads), pre, post)?.map(|(roots, heads)| {
                 RevsetExpression::Range {
                     roots,
                     heads,
                     generation: generation.clone(),
                 }
             }),
-            RevsetExpression::DagRange { roots, heads } => transform_rec_pair((roots, heads), f)?
-                .map(|(roots, heads)| RevsetExpression::DagRange { roots, heads }),
-            RevsetExpression::VisibleHeads => None,
+            RevsetExpression::DagRange { roots, heads } => {
+                transform_rec_pair((roots, heads), pre, post)?
+                    .map(|(roots, heads)| RevsetExpression::DagRange { roots, heads })
+            }
+            RevsetExpression::Reachable { sources, domain } => {
+                transform_rec_pair((sources, domain), pre, post)?
+                    .map(|(sources, domain)| RevsetExpression::Reachable { sources, domain })
+            }
             RevsetExpression::Heads(candidates) => {
-                transform_rec(candidates, f)?.map(RevsetExpression::Heads)
+                transform_rec(candidates, pre, post)?.map(RevsetExpression::Heads)
             }
             RevsetExpression::Roots(candidates) => {
-                transform_rec(candidates, f)?.map(RevsetExpression::Roots)
+                transform_rec(candidates, pre, post)?.map(RevsetExpression::Roots)
             }
-            RevsetExpression::PublicHeads => None,
-            RevsetExpression::Branches(_) => None,
-            RevsetExpression::RemoteBranches { .. } => None,
-            RevsetExpression::Tags => None,
-            RevsetExpression::GitRefs => None,
-            RevsetExpression::GitHead => None,
-            RevsetExpression::Latest { candidates, count } => {
-                transform_rec(candidates, f)?.map(|candidates| RevsetExpression::Latest {
+            RevsetExpression::Latest { candidates, count } => transform_rec(candidates, pre, post)?
+                .map(|candidates| RevsetExpression::Latest {
                     candidates,
                     count: *count,
-                })
-            }
+                }),
             RevsetExpression::Filter(_) => None,
             RevsetExpression::AsFilter(candidates) => {
-                transform_rec(candidates, f)?.map(RevsetExpression::AsFilter)
+                transform_rec(candidates, pre, post)?.map(RevsetExpression::AsFilter)
             }
-            RevsetExpression::Present(candidates) => match transform_rec(candidates, f) {
-                Ok(None) => None,
-                Ok(Some(expression)) => Some(RevsetExpression::Present(expression)),
-                Err(RevsetError::NoSuchRevision(_)) => Some(RevsetExpression::None),
-                r @ Err(RevsetError::AmbiguousIdPrefix(_) | RevsetError::StoreError(_)) => {
-                    return r;
-                }
-            },
+            RevsetExpression::Present(candidates) => {
+                transform_rec(candidates, pre, post)?.map(RevsetExpression::Present)
+            }
             RevsetExpression::NotIn(complement) => {
-                transform_rec(complement, f)?.map(RevsetExpression::NotIn)
+                transform_rec(complement, pre, post)?.map(RevsetExpression::NotIn)
             }
             RevsetExpression::Union(expression1, expression2) => {
-                transform_rec_pair((expression1, expression2), f)?.map(
+                transform_rec_pair((expression1, expression2), pre, post)?.map(
                     |(expression1, expression2)| RevsetExpression::Union(expression1, expression2),
                 )
             }
             RevsetExpression::Intersection(expression1, expression2) => {
-                transform_rec_pair((expression1, expression2), f)?.map(
+                transform_rec_pair((expression1, expression2), pre, post)?.map(
                     |(expression1, expression2)| {
                         RevsetExpression::Intersection(expression1, expression2)
                     },
                 )
             }
             RevsetExpression::Difference(expression1, expression2) => {
-                transform_rec_pair((expression1, expression2), f)?.map(
+                transform_rec_pair((expression1, expression2), pre, post)?.map(
                     |(expression1, expression2)| {
                         RevsetExpression::Difference(expression1, expression2)
                     },
@@ -1205,13 +1037,14 @@ fn try_transform_expression_bottom_up(
     }
 
     #[allow(clippy::type_complexity)]
-    fn transform_rec_pair(
+    fn transform_rec_pair<E>(
         (expression1, expression2): (&Rc<RevsetExpression>, &Rc<RevsetExpression>),
-        f: &mut impl FnMut(&Rc<RevsetExpression>) -> TransformResult,
-    ) -> Result<Option<(Rc<RevsetExpression>, Rc<RevsetExpression>)>, RevsetError> {
+        pre: &mut impl FnMut(&Rc<RevsetExpression>) -> Result<TransformedExpression, E>,
+        post: &mut impl FnMut(&Rc<RevsetExpression>) -> Result<TransformedExpression, E>,
+    ) -> Result<Option<(Rc<RevsetExpression>, Rc<RevsetExpression>)>, E> {
         match (
-            transform_rec(expression1, f)?,
-            transform_rec(expression2, f)?,
+            transform_rec(expression1, pre, post)?,
+            transform_rec(expression2, pre, post)?,
         ) {
             (Some(new_expression1), Some(new_expression2)) => {
                 Ok(Some((new_expression1, new_expression2)))
@@ -1222,19 +1055,23 @@ fn try_transform_expression_bottom_up(
         }
     }
 
-    fn transform_rec(
+    fn transform_rec<E>(
         expression: &Rc<RevsetExpression>,
-        f: &mut impl FnMut(&Rc<RevsetExpression>) -> TransformResult,
-    ) -> TransformResult {
-        if let Some(new_expression) = transform_child_rec(expression, f)? {
+        pre: &mut impl FnMut(&Rc<RevsetExpression>) -> Result<TransformedExpression, E>,
+        post: &mut impl FnMut(&Rc<RevsetExpression>) -> Result<TransformedExpression, E>,
+    ) -> Result<TransformedExpression, E> {
+        if let Some(new_expression) = pre(expression)? {
+            return Ok(Some(new_expression));
+        }
+        if let Some(new_expression) = transform_child_rec(expression, pre, post)? {
             // must propagate new expression tree
-            Ok(Some(f(&new_expression)?.unwrap_or(new_expression)))
+            Ok(Some(post(&new_expression)?.unwrap_or(new_expression)))
         } else {
-            f(expression)
+            post(expression)
         }
     }
 
-    transform_rec(expression, &mut f)
+    transform_rec(expression, &mut pre, &mut post)
 }
 
 /// Transforms filter expressions, by applying the following rules.
@@ -1245,7 +1082,7 @@ fn try_transform_expression_bottom_up(
 ///    help further optimization (e.g. combine `file(_)` matchers.)
 /// c. Wraps union of filter and set (e.g. `author(_) | heads()`), to
 ///    ensure inner filter wouldn't need to evaluate all the input sets.
-fn internalize_filter(expression: &Rc<RevsetExpression>) -> Option<Rc<RevsetExpression>> {
+fn internalize_filter(expression: &Rc<RevsetExpression>) -> TransformedExpression {
     fn is_filter(expression: &RevsetExpression) -> bool {
         matches!(
             expression,
@@ -1275,7 +1112,7 @@ fn internalize_filter(expression: &Rc<RevsetExpression>) -> Option<Rc<RevsetExpr
     fn intersect_down(
         expression1: &Rc<RevsetExpression>,
         expression2: &Rc<RevsetExpression>,
-    ) -> Option<Rc<RevsetExpression>> {
+    ) -> TransformedExpression {
         let recurse = |e1, e2| intersect_down(e1, e2).unwrap_or_else(|| e1.intersection(e2));
         match (expression1.as_ref(), expression2.as_ref()) {
             // Don't reorder 'f1 & f2'
@@ -1320,7 +1157,7 @@ fn internalize_filter(expression: &Rc<RevsetExpression>) -> Option<Rc<RevsetExpr
 ///
 /// This does not rewrite 'x & none()' to 'none()' because 'x' may be an invalid
 /// symbol.
-fn fold_redundant_expression(expression: &Rc<RevsetExpression>) -> Option<Rc<RevsetExpression>> {
+fn fold_redundant_expression(expression: &Rc<RevsetExpression>) -> TransformedExpression {
     transform_expression_bottom_up(expression, |expression| match expression.as_ref() {
         RevsetExpression::NotIn(outer) => match outer.as_ref() {
             RevsetExpression::NotIn(inner) => Some(inner.clone()),
@@ -1337,33 +1174,58 @@ fn fold_redundant_expression(expression: &Rc<RevsetExpression>) -> Option<Rc<Rev
     })
 }
 
+fn to_difference_range(
+    expression: &Rc<RevsetExpression>,
+    complement: &Rc<RevsetExpression>,
+) -> TransformedExpression {
+    match (expression.as_ref(), complement.as_ref()) {
+        // ::heads & ~(::roots) -> roots..heads
+        (
+            RevsetExpression::Ancestors { heads, generation },
+            RevsetExpression::Ancestors {
+                heads: roots,
+                generation: GENERATION_RANGE_FULL,
+            },
+        ) => Some(Rc::new(RevsetExpression::Range {
+            roots: roots.clone(),
+            heads: heads.clone(),
+            generation: generation.clone(),
+        })),
+        // ::heads & ~(::roots-) -> ::heads & ~ancestors(roots, 1..) -> roots-..heads
+        (
+            RevsetExpression::Ancestors { heads, generation },
+            RevsetExpression::Ancestors {
+                heads: roots,
+                generation:
+                    Range {
+                        start: roots_start,
+                        end: u64::MAX,
+                    },
+            },
+        ) => Some(Rc::new(RevsetExpression::Range {
+            roots: roots.ancestors_at(*roots_start),
+            heads: heads.clone(),
+            generation: generation.clone(),
+        })),
+        _ => None,
+    }
+}
+
 /// Transforms negative intersection to difference. Redundant intersections like
 /// `all() & e` should have been removed.
-fn fold_difference(expression: &Rc<RevsetExpression>) -> Option<Rc<RevsetExpression>> {
+fn fold_difference(expression: &Rc<RevsetExpression>) -> TransformedExpression {
     fn to_difference(
         expression: &Rc<RevsetExpression>,
         complement: &Rc<RevsetExpression>,
     ) -> Rc<RevsetExpression> {
-        match (expression.as_ref(), complement.as_ref()) {
-            // :heads & ~(:roots) -> roots..heads
-            (
-                RevsetExpression::Ancestors { heads, generation },
-                RevsetExpression::Ancestors {
-                    heads: roots,
-                    generation: GENERATION_RANGE_FULL,
-                },
-            ) => Rc::new(RevsetExpression::Range {
-                roots: roots.clone(),
-                heads: heads.clone(),
-                generation: generation.clone(),
-            }),
-            _ => expression.minus(complement),
-        }
+        to_difference_range(expression, complement).unwrap_or_else(|| expression.minus(complement))
     }
 
     transform_expression_bottom_up(expression, |expression| match expression.as_ref() {
         RevsetExpression::Intersection(expression1, expression2) => {
             match (expression1.as_ref(), expression2.as_ref()) {
+                // For '~x & f', don't move filter node 'f' left
+                (_, RevsetExpression::Filter(_) | RevsetExpression::AsFilter(_)) => None,
                 (_, RevsetExpression::NotIn(complement)) => {
                     Some(to_difference(expression1, complement))
                 }
@@ -1377,13 +1239,30 @@ fn fold_difference(expression: &Rc<RevsetExpression>) -> Option<Rc<RevsetExpress
     })
 }
 
+/// Transforms remaining negated ancestors `~(::h)` to range `h..`.
+///
+/// Since this rule inserts redundant `visible_heads()`, negative intersections
+/// should have been transformed.
+fn fold_not_in_ancestors(expression: &Rc<RevsetExpression>) -> TransformedExpression {
+    transform_expression_bottom_up(expression, |expression| match expression.as_ref() {
+        RevsetExpression::NotIn(complement)
+            if matches!(complement.as_ref(), RevsetExpression::Ancestors { .. }) =>
+        {
+            // ~(::heads) -> heads..
+            // ~(::heads-) -> ~ancestors(heads, 1..) -> heads-..
+            to_difference_range(&RevsetExpression::visible_heads().ancestors(), complement)
+        }
+        _ => None,
+    })
+}
+
 /// Transforms binary difference to more primitive negative intersection.
 ///
 /// For example, `all() ~ e` will become `all() & ~e`, which can be simplified
 /// further by `fold_redundant_expression()`.
-fn unfold_difference(expression: &Rc<RevsetExpression>) -> Option<Rc<RevsetExpression>> {
+fn unfold_difference(expression: &Rc<RevsetExpression>) -> TransformedExpression {
     transform_expression_bottom_up(expression, |expression| match expression.as_ref() {
-        // roots..heads -> :heads & ~(:roots)
+        // roots..heads -> ::heads & ~(::roots)
         RevsetExpression::Range {
             roots,
             heads,
@@ -1402,8 +1281,20 @@ fn unfold_difference(expression: &Rc<RevsetExpression>) -> Option<Rc<RevsetExpre
     })
 }
 
-/// Transforms nested `ancestors()`/`parents()` like `h---`.
-fn fold_ancestors(expression: &Rc<RevsetExpression>) -> Option<Rc<RevsetExpression>> {
+/// Transforms nested `ancestors()`/`parents()`/`descendants()`/`children()`
+/// like `h---`/`r+++`.
+fn fold_generation(expression: &Rc<RevsetExpression>) -> TransformedExpression {
+    fn add_generation(generation1: &Range<u64>, generation2: &Range<u64>) -> Range<u64> {
+        // For any (g1, g2) in (generation1, generation2), g1 + g2.
+        if generation1.is_empty() || generation2.is_empty() {
+            GENERATION_RANGE_EMPTY
+        } else {
+            let start = u64::saturating_add(generation1.start, generation2.start);
+            let end = u64::saturating_add(generation1.end, generation2.end - 1);
+            start..end
+        }
+    }
+
     transform_expression_bottom_up(expression, |expression| match expression.as_ref() {
         RevsetExpression::Ancestors {
             heads,
@@ -1411,25 +1302,33 @@ fn fold_ancestors(expression: &Rc<RevsetExpression>) -> Option<Rc<RevsetExpressi
         } => {
             match heads.as_ref() {
                 // (h-)- -> ancestors(ancestors(h, 1), 1) -> ancestors(h, 2)
-                // :(h-) -> ancestors(ancestors(h, 1), ..) -> ancestors(h, 1..)
-                // (:h)- -> ancestors(ancestors(h, ..), 1) -> ancestors(h, 1..)
+                // ::(h-) -> ancestors(ancestors(h, 1), ..) -> ancestors(h, 1..)
+                // (::h)- -> ancestors(ancestors(h, ..), 1) -> ancestors(h, 1..)
                 RevsetExpression::Ancestors {
                     heads,
                     generation: generation2,
-                } => {
-                    // For any (g1, g2) in (generation1, generation2), g1 + g2.
-                    let generation = if generation1.is_empty() || generation2.is_empty() {
-                        GENERATION_RANGE_EMPTY
-                    } else {
-                        let start = u32::saturating_add(generation1.start, generation2.start);
-                        let end = u32::saturating_add(generation1.end, generation2.end - 1);
-                        start..end
-                    };
-                    Some(Rc::new(RevsetExpression::Ancestors {
-                        heads: heads.clone(),
-                        generation,
-                    }))
-                }
+                } => Some(Rc::new(RevsetExpression::Ancestors {
+                    heads: heads.clone(),
+                    generation: add_generation(generation1, generation2),
+                })),
+                _ => None,
+            }
+        }
+        RevsetExpression::Descendants {
+            roots,
+            generation: generation1,
+        } => {
+            match roots.as_ref() {
+                // (r+)+ -> descendants(descendants(r, 1), 1) -> descendants(r, 2)
+                // (r+):: -> descendants(descendants(r, 1), ..) -> descendants(r, 1..)
+                // (r::)+ -> descendants(descendants(r, ..), 1) -> descendants(r, 1..)
+                RevsetExpression::Descendants {
+                    roots,
+                    generation: generation2,
+                } => Some(Rc::new(RevsetExpression::Descendants {
+                    roots: roots.clone(),
+                    generation: add_generation(generation1, generation2),
+                })),
                 _ => None,
             }
         }
@@ -1443,237 +1342,594 @@ fn fold_ancestors(expression: &Rc<RevsetExpression>) -> Option<Rc<RevsetExpressi
 pub fn optimize(expression: Rc<RevsetExpression>) -> Rc<RevsetExpression> {
     let expression = unfold_difference(&expression).unwrap_or(expression);
     let expression = fold_redundant_expression(&expression).unwrap_or(expression);
-    let expression = fold_ancestors(&expression).unwrap_or(expression);
+    let expression = fold_generation(&expression).unwrap_or(expression);
     let expression = internalize_filter(&expression).unwrap_or(expression);
-    fold_difference(&expression).unwrap_or(expression)
+    let expression = fold_difference(&expression).unwrap_or(expression);
+    fold_not_in_ancestors(&expression).unwrap_or(expression)
 }
 
-fn resolve_git_ref(repo: &dyn Repo, symbol: &str) -> Option<Vec<CommitId>> {
+// TODO: find better place to host this function (or add compile-time revset
+// parsing and resolution like
+// `revset!("{unwanted}..{wanted}").evaluate(repo)`?)
+pub fn walk_revs<'index>(
+    repo: &'index dyn Repo,
+    wanted: &[CommitId],
+    unwanted: &[CommitId],
+) -> Result<Box<dyn Revset + 'index>, RevsetEvaluationError> {
+    RevsetExpression::commits(unwanted.to_vec())
+        .range(&RevsetExpression::commits(wanted.to_vec()))
+        .evaluate_programmatic(repo)
+}
+
+fn resolve_remote_branch(repo: &dyn Repo, name: &str, remote: &str) -> Option<Vec<CommitId>> {
     let view = repo.view();
-    for git_ref_prefix in &["", "refs/", "refs/heads/", "refs/tags/", "refs/remotes/"] {
-        if let Some(ref_target) = view.git_refs().get(&(git_ref_prefix.to_string() + symbol)) {
-            return Some(ref_target.adds());
-        }
-    }
-    None
+    let target = match (name, remote) {
+        ("HEAD", git::REMOTE_NAME_FOR_LOCAL_GIT_REPO) => view.git_head(),
+        (name, remote) => &view.get_remote_branch(name, remote).target,
+    };
+    target
+        .is_present()
+        .then(|| target.added_ids().cloned().collect())
 }
 
-fn resolve_branch(repo: &dyn Repo, symbol: &str) -> Option<Vec<CommitId>> {
-    if let Some(branch_target) = repo.view().branches().get(symbol) {
-        return Some(
-            branch_target
-                .local_target
+fn all_branch_symbols(
+    repo: &dyn Repo,
+    include_synced_remotes: bool,
+) -> impl Iterator<Item = String> + '_ {
+    let view = repo.view();
+    view.branches()
+        .flat_map(move |(name, branch_target)| {
+            // Remote branch "x"@"y" may conflict with local "x@y" in unquoted form.
+            let local_target = branch_target.local_target;
+            let local_symbol = local_target.is_present().then(|| name.to_owned());
+            let remote_symbols = branch_target
+                .remote_refs
+                .into_iter()
+                .filter(move |&(_, remote_ref)| {
+                    include_synced_remotes
+                        || !remote_ref.is_tracking()
+                        || remote_ref.target != *local_target
+                })
+                .map(move |(remote_name, _)| format!("{name}@{remote_name}"));
+            local_symbol.into_iter().chain(remote_symbols)
+        })
+        .chain(view.git_head().is_present().then(|| "HEAD@git".to_owned()))
+}
+
+fn make_no_such_symbol_error(repo: &dyn Repo, name: impl Into<String>) -> RevsetResolutionError {
+    let name = name.into();
+    // TODO: include tags?
+    let branch_names = all_branch_symbols(repo, name.contains('@'));
+    let candidates = collect_similar(&name, branch_names);
+    RevsetResolutionError::NoSuchRevision { name, candidates }
+}
+
+pub trait SymbolResolver {
+    fn resolve_symbol(&self, symbol: &str) -> Result<Vec<CommitId>, RevsetResolutionError>;
+}
+
+/// Fails on any attempt to resolve a symbol.
+pub struct FailingSymbolResolver;
+
+impl SymbolResolver for FailingSymbolResolver {
+    fn resolve_symbol(&self, symbol: &str) -> Result<Vec<CommitId>, RevsetResolutionError> {
+        Err(RevsetResolutionError::NoSuchRevision {
+            name: format!(
+                "Won't resolve symbol {symbol:?}. When creating revsets programmatically, avoid \
+                 using RevsetExpression::symbol(); use RevsetExpression::commits() instead."
+            ),
+            candidates: Default::default(),
+        })
+    }
+}
+
+/// A symbol resolver for a specific namespace of labels.
+///
+/// Returns None if it cannot handle the symbol.
+pub trait PartialSymbolResolver {
+    fn resolve_symbol(
+        &self,
+        repo: &dyn Repo,
+        symbol: &str,
+    ) -> Result<Option<Vec<CommitId>>, RevsetResolutionError>;
+}
+
+struct TagResolver;
+
+impl PartialSymbolResolver for TagResolver {
+    fn resolve_symbol(
+        &self,
+        repo: &dyn Repo,
+        symbol: &str,
+    ) -> Result<Option<Vec<CommitId>>, RevsetResolutionError> {
+        let target = repo.view().get_tag(symbol);
+        Ok(target
+            .is_present()
+            .then(|| target.added_ids().cloned().collect()))
+    }
+}
+
+struct BranchResolver;
+
+impl PartialSymbolResolver for BranchResolver {
+    fn resolve_symbol(
+        &self,
+        repo: &dyn Repo,
+        symbol: &str,
+    ) -> Result<Option<Vec<CommitId>>, RevsetResolutionError> {
+        let target = repo.view().get_local_branch(symbol);
+        Ok(target
+            .is_present()
+            .then(|| target.added_ids().cloned().collect()))
+    }
+}
+
+struct GitRefResolver;
+
+impl PartialSymbolResolver for GitRefResolver {
+    fn resolve_symbol(
+        &self,
+        repo: &dyn Repo,
+        symbol: &str,
+    ) -> Result<Option<Vec<CommitId>>, RevsetResolutionError> {
+        let view = repo.view();
+        for git_ref_prefix in &["", "refs/"] {
+            let target = view.get_git_ref(&(git_ref_prefix.to_string() + symbol));
+            if target.is_present() {
+                return Ok(Some(target.added_ids().cloned().collect()));
+            }
+        }
+
+        Ok(None)
+    }
+}
+
+const DEFAULT_RESOLVERS: &[&'static dyn PartialSymbolResolver] =
+    &[&TagResolver, &BranchResolver, &GitRefResolver];
+
+#[derive(Default)]
+struct CommitPrefixResolver<'a> {
+    context: Option<&'a IdPrefixContext>,
+}
+
+impl PartialSymbolResolver for CommitPrefixResolver<'_> {
+    fn resolve_symbol(
+        &self,
+        repo: &dyn Repo,
+        symbol: &str,
+    ) -> Result<Option<Vec<CommitId>>, RevsetResolutionError> {
+        if let Some(prefix) = HexPrefix::new(symbol) {
+            let resolution = self
+                .context
                 .as_ref()
-                .map(|target| target.adds())
-                .unwrap_or_default(),
-        );
+                .map(|ctx| ctx.resolve_commit_prefix(repo, &prefix))
+                .unwrap_or_else(|| repo.index().resolve_commit_id_prefix(&prefix));
+            match resolution {
+                PrefixResolution::AmbiguousMatch => Err(
+                    RevsetResolutionError::AmbiguousCommitIdPrefix(symbol.to_owned()),
+                ),
+                PrefixResolution::SingleMatch(id) => Ok(Some(vec![id])),
+                PrefixResolution::NoMatch => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
     }
-    if let Some((name, remote_name)) = symbol.split_once('@') {
-        if let Some(branch_target) = repo.view().branches().get(name) {
-            if let Some(target) = branch_target.remote_targets.get(remote_name) {
-                return Some(target.adds());
+}
+
+#[derive(Default)]
+struct ChangePrefixResolver<'a> {
+    context: Option<&'a IdPrefixContext>,
+}
+
+impl PartialSymbolResolver for ChangePrefixResolver<'_> {
+    fn resolve_symbol(
+        &self,
+        repo: &dyn Repo,
+        symbol: &str,
+    ) -> Result<Option<Vec<CommitId>>, RevsetResolutionError> {
+        if let Some(prefix) = to_forward_hex(symbol).as_deref().and_then(HexPrefix::new) {
+            let resolution = self
+                .context
+                .as_ref()
+                .map(|ctx| ctx.resolve_change_prefix(repo, &prefix))
+                .unwrap_or_else(|| repo.resolve_change_id_prefix(&prefix));
+            match resolution {
+                PrefixResolution::AmbiguousMatch => Err(
+                    RevsetResolutionError::AmbiguousChangeIdPrefix(symbol.to_owned()),
+                ),
+                PrefixResolution::SingleMatch(ids) => Ok(Some(ids)),
+                PrefixResolution::NoMatch => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// An extension of the DefaultSymbolResolver.
+///
+/// Each PartialSymbolResolver will be invoked in order, its result used if one
+/// is provided. Native resolvers are always invoked first. In the future, we
+/// may provide a way for extensions to override native resolvers like tags and
+/// branches.
+pub trait SymbolResolverExtension {
+    /// PartialSymbolResolvers can capture `repo` for caching purposes if
+    /// desired, but they do not have to since `repo` is passed into
+    /// `resolve_symbol()` as well.
+    fn new_resolvers<'a>(&self, repo: &'a dyn Repo) -> Vec<Box<dyn PartialSymbolResolver + 'a>>;
+}
+
+/// Resolves branches, remote branches, tags, git refs, and full and abbreviated
+/// commit and change ids.
+pub struct DefaultSymbolResolver<'a> {
+    repo: &'a dyn Repo,
+    commit_id_resolver: CommitPrefixResolver<'a>,
+    change_id_resolver: ChangePrefixResolver<'a>,
+    extensions: Vec<Box<dyn PartialSymbolResolver + 'a>>,
+}
+
+impl<'a> DefaultSymbolResolver<'a> {
+    pub fn new(repo: &'a dyn Repo, extensions: &[impl AsRef<dyn SymbolResolverExtension>]) -> Self {
+        DefaultSymbolResolver {
+            repo,
+            commit_id_resolver: Default::default(),
+            change_id_resolver: Default::default(),
+            extensions: extensions
+                .iter()
+                .flat_map(|ext| ext.as_ref().new_resolvers(repo))
+                .collect(),
+        }
+    }
+
+    pub fn with_id_prefix_context(mut self, id_prefix_context: &'a IdPrefixContext) -> Self {
+        self.commit_id_resolver.context = Some(id_prefix_context);
+        self.change_id_resolver.context = Some(id_prefix_context);
+        self
+    }
+
+    fn partial_resolvers(&self) -> impl Iterator<Item = &(dyn PartialSymbolResolver + 'a)> {
+        let prefix_resolvers: [&dyn PartialSymbolResolver; 2] =
+            [&self.commit_id_resolver, &self.change_id_resolver];
+        itertools::chain!(
+            DEFAULT_RESOLVERS.iter().copied(),
+            prefix_resolvers,
+            self.extensions.iter().map(|e| e.as_ref())
+        )
+    }
+}
+
+impl SymbolResolver for DefaultSymbolResolver<'_> {
+    fn resolve_symbol(&self, symbol: &str) -> Result<Vec<CommitId>, RevsetResolutionError> {
+        if symbol.is_empty() {
+            return Err(RevsetResolutionError::EmptyString);
+        }
+
+        for partial_resolver in self.partial_resolvers() {
+            if let Some(ids) = partial_resolver.resolve_symbol(self.repo, symbol)? {
+                return Ok(ids);
             }
         }
+
+        Err(make_no_such_symbol_error(self.repo, symbol))
     }
-    None
 }
 
-fn resolve_full_commit_id(
+fn resolve_commit_ref(
     repo: &dyn Repo,
-    symbol: &str,
-) -> Result<Option<Vec<CommitId>>, RevsetError> {
-    if let Ok(binary_commit_id) = hex::decode(symbol) {
-        if repo.store().commit_id_length() != binary_commit_id.len() {
-            return Ok(None);
-        }
-        let commit_id = CommitId::new(binary_commit_id);
-        match repo.store().get_commit(&commit_id) {
-            // Only recognize a commit if we have indexed it
-            Ok(_) if repo.index().has_id(&commit_id) => Ok(Some(vec![commit_id])),
-            Ok(_) | Err(BackendError::ObjectNotFound { .. }) => Ok(None),
-            Err(err) => Err(RevsetError::StoreError(err)),
-        }
-    } else {
-        Ok(None)
-    }
-}
-
-fn resolve_short_commit_id(
-    repo: &dyn Repo,
-    symbol: &str,
-) -> Result<Option<Vec<CommitId>>, RevsetError> {
-    if let Some(prefix) = HexPrefix::new(symbol) {
-        match repo.index().resolve_prefix(&prefix) {
-            PrefixResolution::NoMatch => Ok(None),
-            PrefixResolution::AmbiguousMatch => {
-                Err(RevsetError::AmbiguousIdPrefix(symbol.to_owned()))
-            }
-            PrefixResolution::SingleMatch(commit_id) => Ok(Some(vec![commit_id])),
-        }
-    } else {
-        Ok(None)
-    }
-}
-
-fn resolve_change_id(repo: &dyn Repo, symbol: &str) -> Result<Option<Vec<CommitId>>, RevsetError> {
-    if let Some(prefix) = to_forward_hex(symbol).as_deref().and_then(HexPrefix::new) {
-        match repo.resolve_change_id_prefix(&prefix) {
-            PrefixResolution::NoMatch => Ok(None),
-            PrefixResolution::AmbiguousMatch => {
-                Err(RevsetError::AmbiguousIdPrefix(symbol.to_owned()))
-            }
-            PrefixResolution::SingleMatch(entries) => Ok(Some(entries)),
-        }
-    } else {
-        Ok(None)
-    }
-}
-
-pub fn resolve_symbol(
-    repo: &dyn Repo,
-    symbol: &str,
-    workspace_id: Option<&WorkspaceId>,
-) -> Result<Vec<CommitId>, RevsetError> {
-    if symbol.ends_with('@') {
-        let target_workspace = if symbol == "@" {
-            if let Some(workspace_id) = workspace_id {
-                workspace_id.clone()
+    commit_ref: &RevsetCommitRef,
+    symbol_resolver: &dyn SymbolResolver,
+) -> Result<Vec<CommitId>, RevsetResolutionError> {
+    match commit_ref {
+        RevsetCommitRef::Symbol(symbol) => symbol_resolver.resolve_symbol(symbol),
+        RevsetCommitRef::RemoteSymbol { name, remote } => resolve_remote_branch(repo, name, remote)
+            .ok_or_else(|| make_no_such_symbol_error(repo, format!("{name}@{remote}"))),
+        RevsetCommitRef::WorkingCopy(workspace_id) => {
+            if let Some(commit_id) = repo.view().get_wc_commit_id(workspace_id) {
+                Ok(vec![commit_id.clone()])
             } else {
-                return Err(RevsetError::NoSuchRevision(symbol.to_owned()));
+                Err(RevsetResolutionError::WorkspaceMissingWorkingCopy {
+                    name: workspace_id.as_str().to_string(),
+                })
             }
-        } else {
-            WorkspaceId::new(symbol.strip_suffix('@').unwrap().to_string())
-        };
-        if let Some(commit_id) = repo.view().get_wc_commit_id(&target_workspace) {
-            Ok(vec![commit_id.clone()])
-        } else {
-            Err(RevsetError::NoSuchRevision(symbol.to_owned()))
         }
-    } else if symbol == "root" {
-        Ok(vec![repo.store().root_commit_id().clone()])
-    } else {
-        // Try to resolve as a tag
-        if let Some(target) = repo.view().tags().get(symbol) {
-            return Ok(target.adds());
+        RevsetCommitRef::WorkingCopies => {
+            let wc_commits = repo.view().wc_commit_ids().values().cloned().collect_vec();
+            Ok(wc_commits)
         }
-
-        // Try to resolve as a branch
-        if let Some(ids) = resolve_branch(repo, symbol) {
-            return Ok(ids);
+        RevsetCommitRef::VisibleHeads => Ok(repo.view().heads().iter().cloned().collect_vec()),
+        RevsetCommitRef::Root => Ok(vec![repo.store().root_commit_id().clone()]),
+        RevsetCommitRef::Branches(pattern) => {
+            let commit_ids = repo
+                .view()
+                .local_branches_matching(pattern)
+                .flat_map(|(_, target)| target.added_ids())
+                .cloned()
+                .collect();
+            Ok(commit_ids)
         }
-
-        // Try to resolve as a git ref
-        if let Some(ids) = resolve_git_ref(repo, symbol) {
-            return Ok(ids);
+        RevsetCommitRef::RemoteBranches {
+            branch_pattern,
+            remote_pattern,
+        } => {
+            // TODO: should we allow to select @git branches explicitly?
+            let commit_ids = repo
+                .view()
+                .remote_branches_matching(branch_pattern, remote_pattern)
+                .filter(|&((_, remote_name), _)| remote_name != git::REMOTE_NAME_FOR_LOCAL_GIT_REPO)
+                .flat_map(|(_, remote_ref)| remote_ref.target.added_ids())
+                .cloned()
+                .collect();
+            Ok(commit_ids)
         }
-
-        // Try to resolve as a full commit id. We assume a full commit id is unambiguous
-        // even if it's shorter than change id.
-        if let Some(ids) = resolve_full_commit_id(repo, symbol)? {
-            return Ok(ids);
+        RevsetCommitRef::Tags => {
+            let mut commit_ids = vec![];
+            for ref_target in repo.view().tags().values() {
+                commit_ids.extend(ref_target.added_ids().cloned());
+            }
+            Ok(commit_ids)
         }
-
-        // Try to resolve as a commit id.
-        if let Some(ids) = resolve_short_commit_id(repo, symbol)? {
-            return Ok(ids);
+        RevsetCommitRef::GitRefs => {
+            let mut commit_ids = vec![];
+            for ref_target in repo.view().git_refs().values() {
+                commit_ids.extend(ref_target.added_ids().cloned());
+            }
+            Ok(commit_ids)
         }
-
-        // Try to resolve as a change id.
-        if let Some(ids) = resolve_change_id(repo, symbol)? {
-            return Ok(ids);
-        }
-
-        Err(RevsetError::NoSuchRevision(symbol.to_owned()))
+        RevsetCommitRef::GitHead => Ok(repo.view().git_head().added_ids().cloned().collect()),
     }
 }
 
-// TODO: Maybe return a new type (RevsetParameters?) instead of
-// RevsetExpression. Then pass that to evaluate(), so it's clear which variants
-// are allowed.
-pub fn resolve_symbols(
+fn resolve_symbols(
     repo: &dyn Repo,
     expression: Rc<RevsetExpression>,
-    workspace_ctx: Option<&RevsetWorkspaceContext>,
-) -> Result<Rc<RevsetExpression>, RevsetError> {
-    Ok(
-        try_transform_expression_bottom_up(&expression, |expression| {
-            Ok(match expression.as_ref() {
-                RevsetExpression::Symbol(symbol) => {
-                    let commit_ids =
-                        resolve_symbol(repo, symbol, workspace_ctx.map(|ctx| ctx.workspace_id))?;
-                    Some(RevsetExpression::commits(commit_ids))
-                }
-                _ => None,
-            })
-        })?
-        .unwrap_or(expression),
-    )
+    symbol_resolver: &dyn SymbolResolver,
+) -> Result<Rc<RevsetExpression>, RevsetResolutionError> {
+    Ok(try_transform_expression(
+        &expression,
+        |expression| match expression.as_ref() {
+            // 'present(x)' opens new symbol resolution scope to map error to 'none()'.
+            RevsetExpression::Present(candidates) => {
+                resolve_symbols(repo, candidates.clone(), symbol_resolver)
+                    .or_else(|err| match err {
+                        RevsetResolutionError::NoSuchRevision { .. } => {
+                            Ok(RevsetExpression::none())
+                        }
+                        RevsetResolutionError::WorkspaceMissingWorkingCopy { .. }
+                        | RevsetResolutionError::EmptyString
+                        | RevsetResolutionError::AmbiguousCommitIdPrefix(_)
+                        | RevsetResolutionError::AmbiguousChangeIdPrefix(_)
+                        | RevsetResolutionError::StoreError(_)
+                        | RevsetResolutionError::Other(_) => Err(err),
+                    })
+                    .map(Some) // Always rewrite subtree
+            }
+            // Otherwise resolve symbols recursively.
+            _ => Ok(None),
+        },
+        |expression| match expression.as_ref() {
+            RevsetExpression::CommitRef(commit_ref) => {
+                let commit_ids = resolve_commit_ref(repo, commit_ref, symbol_resolver)?;
+                Ok(Some(RevsetExpression::commits(commit_ids)))
+            }
+            _ => Ok(None),
+        },
+    )?
+    .unwrap_or(expression))
 }
 
-pub trait Revset<'index> {
+/// Inserts implicit `all()` and `visible_heads()` nodes to the `expression`.
+///
+/// Symbols and commit refs in the `expression` should have been resolved.
+///
+/// This is a separate step because a symbol-resolved `expression` could be
+/// transformed further to e.g. combine OR-ed `Commits(_)`, or to collect
+/// commit ids to make `all()` include hidden-but-specified commits. The
+/// return type `ResolvedExpression` is stricter than `RevsetExpression`,
+/// and isn't designed for such transformation.
+fn resolve_visibility(repo: &dyn Repo, expression: &RevsetExpression) -> ResolvedExpression {
+    // If we add "operation" scope (#1283), visible_heads might be translated to
+    // `RevsetExpression::WithinOperation(visible_heads, expression)` node to
+    // evaluate filter predicates and "all()" against that scope.
+    let context = VisibilityResolutionContext {
+        visible_heads: &repo.view().heads().iter().cloned().collect_vec(),
+    };
+    context.resolve(expression)
+}
+
+#[derive(Clone, Debug)]
+struct VisibilityResolutionContext<'a> {
+    visible_heads: &'a [CommitId],
+}
+
+impl VisibilityResolutionContext<'_> {
+    /// Resolves expression tree as set.
+    fn resolve(&self, expression: &RevsetExpression) -> ResolvedExpression {
+        match expression {
+            RevsetExpression::None => ResolvedExpression::Commits(vec![]),
+            RevsetExpression::All => self.resolve_all(),
+            RevsetExpression::Commits(commit_ids) => {
+                ResolvedExpression::Commits(commit_ids.clone())
+            }
+            RevsetExpression::StringPattern { .. } => {
+                panic!("Expression '{expression:?}' should be rejected by parser");
+            }
+            RevsetExpression::CommitRef(_) => {
+                panic!("Expression '{expression:?}' should have been resolved by caller");
+            }
+            RevsetExpression::Ancestors { heads, generation } => ResolvedExpression::Ancestors {
+                heads: self.resolve(heads).into(),
+                generation: generation.clone(),
+            },
+            RevsetExpression::Descendants { roots, generation } => ResolvedExpression::DagRange {
+                roots: self.resolve(roots).into(),
+                heads: self.resolve_visible_heads().into(),
+                generation_from_roots: generation.clone(),
+            },
+            RevsetExpression::Range {
+                roots,
+                heads,
+                generation,
+            } => ResolvedExpression::Range {
+                roots: self.resolve(roots).into(),
+                heads: self.resolve(heads).into(),
+                generation: generation.clone(),
+            },
+            RevsetExpression::DagRange { roots, heads } => ResolvedExpression::DagRange {
+                roots: self.resolve(roots).into(),
+                heads: self.resolve(heads).into(),
+                generation_from_roots: GENERATION_RANGE_FULL,
+            },
+            RevsetExpression::Reachable { sources, domain } => ResolvedExpression::Reachable {
+                sources: self.resolve(sources).into(),
+                domain: self.resolve(domain).into(),
+            },
+            RevsetExpression::Heads(candidates) => {
+                ResolvedExpression::Heads(self.resolve(candidates).into())
+            }
+            RevsetExpression::Roots(candidates) => {
+                ResolvedExpression::Roots(self.resolve(candidates).into())
+            }
+            RevsetExpression::Latest { candidates, count } => ResolvedExpression::Latest {
+                candidates: self.resolve(candidates).into(),
+                count: *count,
+            },
+            RevsetExpression::Filter(_) | RevsetExpression::AsFilter(_) => {
+                // Top-level filter without intersection: e.g. "~author(_)" is represented as
+                // `AsFilter(NotIn(Filter(Author(_))))`.
+                ResolvedExpression::FilterWithin {
+                    candidates: self.resolve_all().into(),
+                    predicate: self.resolve_predicate(expression),
+                }
+            }
+            RevsetExpression::Present(_) => {
+                panic!("Expression '{expression:?}' should have been resolved by caller");
+            }
+            RevsetExpression::NotIn(complement) => ResolvedExpression::Difference(
+                self.resolve_all().into(),
+                self.resolve(complement).into(),
+            ),
+            RevsetExpression::Union(expression1, expression2) => ResolvedExpression::Union(
+                self.resolve(expression1).into(),
+                self.resolve(expression2).into(),
+            ),
+            RevsetExpression::Intersection(expression1, expression2) => {
+                match expression2.as_ref() {
+                    RevsetExpression::Filter(_) | RevsetExpression::AsFilter(_) => {
+                        ResolvedExpression::FilterWithin {
+                            candidates: self.resolve(expression1).into(),
+                            predicate: self.resolve_predicate(expression2),
+                        }
+                    }
+                    _ => ResolvedExpression::Intersection(
+                        self.resolve(expression1).into(),
+                        self.resolve(expression2).into(),
+                    ),
+                }
+            }
+            RevsetExpression::Difference(expression1, expression2) => {
+                ResolvedExpression::Difference(
+                    self.resolve(expression1).into(),
+                    self.resolve(expression2).into(),
+                )
+            }
+        }
+    }
+
+    fn resolve_all(&self) -> ResolvedExpression {
+        // Since `all()` does not include hidden commits, some of the logical
+        // transformation rules may subtly change the evaluated set. For example,
+        // `all() & x` is not `x` if `x` is hidden. This wouldn't matter in practice,
+        // but if it does, the heads set could be extended to include the commits
+        // (and `remote_branches()`) specified in the revset expression. Alternatively,
+        // some optimization rules could be removed, but that means `author(_) & x`
+        // would have to test `::visible_heads() & x`.
+        ResolvedExpression::Ancestors {
+            heads: self.resolve_visible_heads().into(),
+            generation: GENERATION_RANGE_FULL,
+        }
+    }
+
+    fn resolve_visible_heads(&self) -> ResolvedExpression {
+        ResolvedExpression::Commits(self.visible_heads.to_owned())
+    }
+
+    /// Resolves expression tree as filter predicate.
+    ///
+    /// For filter expression, this never inserts a hidden `all()` since a
+    /// filter predicate doesn't need to produce revisions to walk.
+    fn resolve_predicate(&self, expression: &RevsetExpression) -> ResolvedPredicateExpression {
+        match expression {
+            RevsetExpression::None
+            | RevsetExpression::All
+            | RevsetExpression::Commits(_)
+            | RevsetExpression::CommitRef(_)
+            | RevsetExpression::StringPattern { .. }
+            | RevsetExpression::Ancestors { .. }
+            | RevsetExpression::Descendants { .. }
+            | RevsetExpression::Range { .. }
+            | RevsetExpression::DagRange { .. }
+            | RevsetExpression::Reachable { .. }
+            | RevsetExpression::Heads(_)
+            | RevsetExpression::Roots(_)
+            | RevsetExpression::Latest { .. } => {
+                ResolvedPredicateExpression::Set(self.resolve(expression).into())
+            }
+            RevsetExpression::Filter(predicate) => {
+                ResolvedPredicateExpression::Filter(predicate.clone())
+            }
+            RevsetExpression::AsFilter(candidates) => self.resolve_predicate(candidates),
+            RevsetExpression::Present(_) => {
+                panic!("Expression '{expression:?}' should have been resolved by caller")
+            }
+            RevsetExpression::NotIn(complement) => {
+                ResolvedPredicateExpression::NotIn(self.resolve_predicate(complement).into())
+            }
+            RevsetExpression::Union(expression1, expression2) => {
+                let predicate1 = self.resolve_predicate(expression1);
+                let predicate2 = self.resolve_predicate(expression2);
+                ResolvedPredicateExpression::Union(predicate1.into(), predicate2.into())
+            }
+            // Intersection of filters should have been substituted by optimize().
+            // If it weren't, just fall back to the set evaluation path.
+            RevsetExpression::Intersection(..) | RevsetExpression::Difference(..) => {
+                ResolvedPredicateExpression::Set(self.resolve(expression).into())
+            }
+        }
+    }
+}
+
+pub trait Revset: fmt::Debug {
     /// Iterate in topological order with children before parents.
-    fn iter(&self) -> Box<dyn Iterator<Item = CommitId> + '_>;
+    fn iter<'a>(&self) -> Box<dyn Iterator<Item = CommitId> + 'a>
+    where
+        Self: 'a;
 
-    fn iter_graph(&self) -> Box<dyn Iterator<Item = (CommitId, Vec<RevsetGraphEdge>)> + '_>;
+    /// Iterates commit/change id pairs in topological order.
+    fn commit_change_ids<'a>(&self) -> Box<dyn Iterator<Item = (CommitId, ChangeId)> + 'a>
+    where
+        Self: 'a;
 
-    fn change_id_index(&self) -> Box<dyn ChangeIdIndex + 'index>;
+    fn iter_graph<'a>(&self) -> Box<dyn Iterator<Item = (CommitId, Vec<RevsetGraphEdge>)> + 'a>
+    where
+        Self: 'a;
 
     fn is_empty(&self) -> bool;
-}
 
-pub trait ChangeIdIndex: Send + Sync {
-    /// Resolve an unambiguous change ID prefix to the commit IDs in the revset.
-    fn resolve_prefix(&self, prefix: &HexPrefix) -> PrefixResolution<Vec<CommitId>>;
+    /// Inclusive lower bound and, optionally, inclusive upper bound of how many
+    /// commits are in the revset. The implementation can use its discretion as
+    /// to how much effort should be put into the estimation, and how accurate
+    /// the resulting estimate should be.
+    fn count_estimate(&self) -> (usize, Option<usize>);
 
-    /// This function returns the shortest length of a prefix of `key` that
-    /// disambiguates it from every other key in the index.
+    /// Returns a closure that checks if a commit is contained within the
+    /// revset.
     ///
-    /// The length to be returned is a number of hexadecimal digits.
-    ///
-    /// This has some properties that we do not currently make much use of:
-    ///
-    /// - The algorithm works even if `key` itself is not in the index.
-    ///
-    /// - In the special case when there are keys in the trie for which our
-    ///   `key` is an exact prefix, returns `key.len() + 1`. Conceptually, in
-    ///   order to disambiguate, you need every letter of the key *and* the
-    ///   additional fact that it's the entire key). This case is extremely
-    ///   unlikely for hashes with 12+ hexadecimal characters.
-    fn shortest_unique_prefix_len(&self, change_id: &ChangeId) -> usize;
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
-pub struct RevsetGraphEdge {
-    pub target: CommitId,
-    pub edge_type: RevsetGraphEdgeType,
-}
-
-impl RevsetGraphEdge {
-    pub fn missing(target: CommitId) -> Self {
-        Self {
-            target,
-            edge_type: RevsetGraphEdgeType::Missing,
-        }
-    }
-    pub fn direct(target: CommitId) -> Self {
-        Self {
-            target,
-            edge_type: RevsetGraphEdgeType::Direct,
-        }
-    }
-    pub fn indirect(target: CommitId) -> Self {
-        Self {
-            target,
-            edge_type: RevsetGraphEdgeType::Indirect,
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Hash)]
-pub enum RevsetGraphEdgeType {
-    Missing,
-    Direct,
-    Indirect,
+    /// The implementation may construct and maintain any necessary internal
+    /// context to optimize the performance of the check.
+    fn containing_fn<'a>(&self) -> Box<dyn Fn(&CommitId) -> bool + 'a>
+    where
+        Self: 'a;
 }
 
 pub trait RevsetIteratorExt<'index, I> {
@@ -1723,7 +1979,82 @@ impl Iterator for ReverseRevsetIterator {
     }
 }
 
-/// Workspace information needed to evaluate revset expression.
+/// A set of extensions for revset evaluation.
+pub struct RevsetExtensions {
+    symbol_resolvers: Vec<Box<dyn SymbolResolverExtension>>,
+    function_map: HashMap<&'static str, RevsetFunction>,
+}
+
+impl Default for RevsetExtensions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RevsetExtensions {
+    pub fn new() -> Self {
+        Self {
+            symbol_resolvers: vec![],
+            function_map: BUILTIN_FUNCTION_MAP.clone(),
+        }
+    }
+
+    pub fn symbol_resolvers(&self) -> &[impl AsRef<dyn SymbolResolverExtension>] {
+        &self.symbol_resolvers
+    }
+
+    pub fn add_symbol_resolver(&mut self, symbol_resolver: Box<dyn SymbolResolverExtension>) {
+        self.symbol_resolvers.push(symbol_resolver);
+    }
+
+    pub fn add_custom_function(&mut self, name: &'static str, func: RevsetFunction) {
+        match self.function_map.entry(name) {
+            hash_map::Entry::Occupied(_) => {
+                panic!("Conflict registering revset function '{name}'")
+            }
+            hash_map::Entry::Vacant(v) => v.insert(func),
+        };
+    }
+}
+
+/// Information needed to parse revset expression.
+#[derive(Clone)]
+pub struct RevsetParseContext<'a> {
+    aliases_map: &'a RevsetAliasesMap,
+    user_email: String,
+    extensions: &'a RevsetExtensions,
+    workspace: Option<RevsetWorkspaceContext<'a>>,
+}
+
+impl<'a> RevsetParseContext<'a> {
+    pub fn new(
+        aliases_map: &'a RevsetAliasesMap,
+        user_email: String,
+        extensions: &'a RevsetExtensions,
+        workspace: Option<RevsetWorkspaceContext<'a>>,
+    ) -> Self {
+        Self {
+            aliases_map,
+            user_email,
+            extensions,
+            workspace,
+        }
+    }
+
+    pub fn aliases_map(&self) -> &'a RevsetAliasesMap {
+        self.aliases_map
+    }
+
+    pub fn user_email(&self) -> &str {
+        &self.user_email
+    }
+
+    pub fn symbol_resolvers(&self) -> &[impl AsRef<dyn SymbolResolverExtension>] {
+        self.extensions.symbol_resolvers()
+    }
+}
+
+/// Workspace information needed to parse revset expression.
 #[derive(Clone, Debug)]
 pub struct RevsetWorkspaceContext<'a> {
     pub cwd: &'a Path,
@@ -1731,52 +2062,22 @@ pub struct RevsetWorkspaceContext<'a> {
     pub workspace_root: &'a Path,
 }
 
-pub struct ReverseRevsetGraphIterator {
-    items: Vec<(CommitId, Vec<RevsetGraphEdge>)>,
-}
-
-impl ReverseRevsetGraphIterator {
-    pub fn new<'revset>(
-        input: Box<dyn Iterator<Item = (CommitId, Vec<RevsetGraphEdge>)> + 'revset>,
-    ) -> Self {
-        let mut entries = vec![];
-        let mut reverse_edges: HashMap<CommitId, Vec<RevsetGraphEdge>> = HashMap::new();
-        for (commit_id, edges) in input {
-            for RevsetGraphEdge { target, edge_type } in edges {
-                reverse_edges
-                    .entry(target)
-                    .or_default()
-                    .push(RevsetGraphEdge {
-                        target: commit_id.clone(),
-                        edge_type,
-                    })
-            }
-            entries.push(commit_id);
-        }
-
-        let mut items = vec![];
-        for commit_id in entries.into_iter() {
-            let edges = reverse_edges.get(&commit_id).cloned().unwrap_or_default();
-            items.push((commit_id, edges));
-        }
-        Self { items }
-    }
-}
-
-impl Iterator for ReverseRevsetGraphIterator {
-    type Item = (CommitId, Vec<RevsetGraphEdge>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.items.pop()
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use assert_matches::assert_matches;
+
     use super::*;
+    use crate::repo_path::RepoPathBuf;
 
     fn parse(revset_str: &str) -> Result<Rc<RevsetExpression>, RevsetParseErrorKind> {
         parse_with_aliases(revset_str, [] as [(&str, &str); 0])
+    }
+
+    fn parse_with_workspace(
+        revset_str: &str,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Rc<RevsetExpression>, RevsetParseErrorKind> {
+        parse_with_aliases_and_workspace(revset_str, [] as [(&str, &str); 0], workspace_id)
     }
 
     fn parse_with_aliases(
@@ -1787,62 +2088,122 @@ mod tests {
         for (decl, defn) in aliases {
             aliases_map.insert(decl, defn).unwrap();
         }
-        // Set up pseudo context to resolve file(path)
+        let extensions = RevsetExtensions::default();
+        let context = RevsetParseContext::new(
+            &aliases_map,
+            "test.user@example.com".to_string(),
+            &extensions,
+            None,
+        );
+        // Map error to comparable object
+        super::parse(revset_str, &context).map_err(|e| e.kind)
+    }
+
+    fn parse_with_aliases_and_workspace(
+        revset_str: &str,
+        aliases: impl IntoIterator<Item = (impl AsRef<str>, impl Into<String>)>,
+        workspace_id: &WorkspaceId,
+    ) -> Result<Rc<RevsetExpression>, RevsetParseErrorKind> {
+        // Set up pseudo context to resolve `workspace_id@` and `file(path)`
         let workspace_ctx = RevsetWorkspaceContext {
             cwd: Path::new("/"),
-            workspace_id: &WorkspaceId::default(),
+            workspace_id,
             workspace_root: Path::new("/"),
         };
+        let mut aliases_map = RevsetAliasesMap::new();
+        for (decl, defn) in aliases {
+            aliases_map.insert(decl, defn).unwrap();
+        }
+        let extensions = RevsetExtensions::default();
+        let context = RevsetParseContext::new(
+            &aliases_map,
+            "test.user@example.com".to_string(),
+            &extensions,
+            Some(workspace_ctx),
+        );
         // Map error to comparable object
-        super::parse(revset_str, &aliases_map, Some(&workspace_ctx)).map_err(|e| e.kind)
+        super::parse(revset_str, &context).map_err(|e| e.kind)
+    }
+
+    fn parse_with_modifier(
+        revset_str: &str,
+    ) -> Result<(Rc<RevsetExpression>, Option<RevsetModifier>), RevsetParseErrorKind> {
+        parse_with_aliases_and_modifier(revset_str, [] as [(&str, &str); 0])
+    }
+
+    fn parse_with_aliases_and_modifier(
+        revset_str: &str,
+        aliases: impl IntoIterator<Item = (impl AsRef<str>, impl Into<String>)>,
+    ) -> Result<(Rc<RevsetExpression>, Option<RevsetModifier>), RevsetParseErrorKind> {
+        let mut aliases_map = RevsetAliasesMap::new();
+        for (decl, defn) in aliases {
+            aliases_map.insert(decl, defn).unwrap();
+        }
+        let extensions = RevsetExtensions::default();
+        let context = RevsetParseContext::new(
+            &aliases_map,
+            "test.user@example.com".to_string(),
+            &extensions,
+            None,
+        );
+        // Map error to comparable object
+        super::parse_with_modifier(revset_str, &context).map_err(|e| e.kind)
     }
 
     #[test]
+    #[allow(clippy::redundant_clone)] // allow symbol.clone()
     fn test_revset_expression_building() {
-        let wc_symbol = RevsetExpression::symbol("@".to_string());
+        let current_wc = RevsetExpression::working_copy(WorkspaceId::default());
         let foo_symbol = RevsetExpression::symbol("foo".to_string());
+        let bar_symbol = RevsetExpression::symbol("bar".to_string());
+        let baz_symbol = RevsetExpression::symbol("baz".to_string());
         assert_eq!(
-            wc_symbol,
-            Rc::new(RevsetExpression::Symbol("@".to_string()))
+            current_wc,
+            Rc::new(RevsetExpression::CommitRef(RevsetCommitRef::WorkingCopy(
+                WorkspaceId::default()
+            ))),
         );
         assert_eq!(
-            wc_symbol.heads(),
-            Rc::new(RevsetExpression::Heads(wc_symbol.clone()))
+            current_wc.heads(),
+            Rc::new(RevsetExpression::Heads(current_wc.clone()))
         );
         assert_eq!(
-            wc_symbol.roots(),
-            Rc::new(RevsetExpression::Roots(wc_symbol.clone()))
+            current_wc.roots(),
+            Rc::new(RevsetExpression::Roots(current_wc.clone()))
         );
         assert_eq!(
-            wc_symbol.parents(),
+            current_wc.parents(),
             Rc::new(RevsetExpression::Ancestors {
-                heads: wc_symbol.clone(),
+                heads: current_wc.clone(),
                 generation: 1..2,
             })
         );
         assert_eq!(
-            wc_symbol.ancestors(),
+            current_wc.ancestors(),
             Rc::new(RevsetExpression::Ancestors {
-                heads: wc_symbol.clone(),
+                heads: current_wc.clone(),
                 generation: GENERATION_RANGE_FULL,
             })
         );
         assert_eq!(
             foo_symbol.children(),
-            Rc::new(RevsetExpression::Children(foo_symbol.clone()))
+            Rc::new(RevsetExpression::Descendants {
+                roots: foo_symbol.clone(),
+                generation: 1..2,
+            }),
         );
         assert_eq!(
             foo_symbol.descendants(),
-            Rc::new(RevsetExpression::DagRange {
+            Rc::new(RevsetExpression::Descendants {
                 roots: foo_symbol.clone(),
-                heads: RevsetExpression::visible_heads(),
+                generation: GENERATION_RANGE_FULL,
             })
         );
         assert_eq!(
-            foo_symbol.dag_range_to(&wc_symbol),
+            foo_symbol.dag_range_to(&current_wc),
             Rc::new(RevsetExpression::DagRange {
                 roots: foo_symbol.clone(),
-                heads: wc_symbol.clone(),
+                heads: current_wc.clone(),
             })
         );
         assert_eq!(
@@ -1853,10 +2214,10 @@ mod tests {
             })
         );
         assert_eq!(
-            foo_symbol.range(&wc_symbol),
+            foo_symbol.range(&current_wc),
             Rc::new(RevsetExpression::Range {
                 roots: foo_symbol.clone(),
-                heads: wc_symbol.clone(),
+                heads: current_wc.clone(),
                 generation: GENERATION_RANGE_FULL,
             })
         );
@@ -1865,32 +2226,155 @@ mod tests {
             Rc::new(RevsetExpression::NotIn(foo_symbol.clone()))
         );
         assert_eq!(
-            foo_symbol.union(&wc_symbol),
+            foo_symbol.union(&current_wc),
             Rc::new(RevsetExpression::Union(
                 foo_symbol.clone(),
-                wc_symbol.clone()
+                current_wc.clone()
             ))
         );
         assert_eq!(
-            foo_symbol.intersection(&wc_symbol),
+            RevsetExpression::union_all(&[]),
+            Rc::new(RevsetExpression::None)
+        );
+        assert_eq!(
+            RevsetExpression::union_all(&[current_wc.clone()]),
+            current_wc
+        );
+        assert_eq!(
+            RevsetExpression::union_all(&[current_wc.clone(), foo_symbol.clone()]),
+            Rc::new(RevsetExpression::Union(
+                current_wc.clone(),
+                foo_symbol.clone(),
+            ))
+        );
+        assert_eq!(
+            RevsetExpression::union_all(&[
+                current_wc.clone(),
+                foo_symbol.clone(),
+                bar_symbol.clone(),
+            ]),
+            Rc::new(RevsetExpression::Union(
+                current_wc.clone(),
+                Rc::new(RevsetExpression::Union(
+                    foo_symbol.clone(),
+                    bar_symbol.clone(),
+                ))
+            ))
+        );
+        assert_eq!(
+            RevsetExpression::union_all(&[
+                current_wc.clone(),
+                foo_symbol.clone(),
+                bar_symbol.clone(),
+                baz_symbol.clone(),
+            ]),
+            Rc::new(RevsetExpression::Union(
+                Rc::new(RevsetExpression::Union(
+                    current_wc.clone(),
+                    foo_symbol.clone(),
+                )),
+                Rc::new(RevsetExpression::Union(
+                    bar_symbol.clone(),
+                    baz_symbol.clone(),
+                ))
+            ))
+        );
+        assert_eq!(
+            foo_symbol.intersection(&current_wc),
             Rc::new(RevsetExpression::Intersection(
                 foo_symbol.clone(),
-                wc_symbol.clone()
+                current_wc.clone()
             ))
         );
         assert_eq!(
-            foo_symbol.minus(&wc_symbol),
-            Rc::new(RevsetExpression::Difference(foo_symbol, wc_symbol.clone()))
+            foo_symbol.minus(&current_wc),
+            Rc::new(RevsetExpression::Difference(foo_symbol, current_wc.clone()))
         );
     }
 
     #[test]
     fn test_parse_revset() {
-        let wc_symbol = RevsetExpression::symbol("@".to_string());
+        let main_workspace_id = WorkspaceId::new("main".to_string());
+        let other_workspace_id = WorkspaceId::new("other".to_string());
+        let main_wc = RevsetExpression::working_copy(main_workspace_id.clone());
         let foo_symbol = RevsetExpression::symbol("foo".to_string());
         let bar_symbol = RevsetExpression::symbol("bar".to_string());
-        // Parse a single symbol (specifically the "checkout" symbol)
-        assert_eq!(parse("@"), Ok(wc_symbol.clone()));
+        // Parse "@" (the current working copy)
+        assert_eq!(
+            parse("@"),
+            Err(RevsetParseErrorKind::WorkingCopyWithoutWorkspace)
+        );
+        assert_eq!(parse("main@"), Ok(main_wc.clone()));
+        assert_eq!(
+            parse_with_workspace("@", &main_workspace_id),
+            Ok(main_wc.clone())
+        );
+        assert_eq!(
+            parse_with_workspace("main@", &other_workspace_id),
+            Ok(main_wc)
+        );
+        assert_eq!(
+            parse("main@origin"),
+            Ok(RevsetExpression::remote_symbol(
+                "main".to_string(),
+                "origin".to_string()
+            ))
+        );
+        // Quoted component in @ expression
+        assert_eq!(
+            parse(r#""foo bar"@"#),
+            Ok(RevsetExpression::working_copy(WorkspaceId::new(
+                "foo bar".to_string()
+            )))
+        );
+        assert_eq!(
+            parse(r#""foo bar"@origin"#),
+            Ok(RevsetExpression::remote_symbol(
+                "foo bar".to_string(),
+                "origin".to_string()
+            ))
+        );
+        assert_eq!(
+            parse(r#"main@"foo bar""#),
+            Ok(RevsetExpression::remote_symbol(
+                "main".to_string(),
+                "foo bar".to_string()
+            ))
+        );
+        assert_eq!(
+            parse(r#"'foo bar'@'bar baz'"#),
+            Ok(RevsetExpression::remote_symbol(
+                "foo bar".to_string(),
+                "bar baz".to_string()
+            ))
+        );
+        // Quoted "@" is not interpreted as a working copy or remote symbol
+        assert_eq!(
+            parse(r#""@""#),
+            Ok(RevsetExpression::symbol("@".to_string()))
+        );
+        assert_eq!(
+            parse(r#""main@""#),
+            Ok(RevsetExpression::symbol("main@".to_string()))
+        );
+        assert_eq!(
+            parse(r#""main@origin""#),
+            Ok(RevsetExpression::symbol("main@origin".to_string()))
+        );
+        // "@" in function argument must be quoted
+        assert_eq!(
+            parse("author(foo@)"),
+            Err(RevsetParseErrorKind::InvalidFunctionArguments {
+                name: "author".to_string(),
+                message: "Expected function argument of string pattern".to_string(),
+            })
+        );
+        assert_eq!(
+            parse(r#"author("foo@")"#),
+            Ok(RevsetExpression::filter(RevsetFilterPredicate::Author(
+                StringPattern::Substring("foo@".to_string()),
+            )))
+        );
         // Parse a single symbol
         assert_eq!(parse("foo"), Ok(foo_symbol.clone()));
         // Internal '.', '-', and '+' are allowed
@@ -1920,23 +2404,34 @@ mod tests {
         assert_eq!(parse("(foo)"), Ok(foo_symbol.clone()));
         // Parse a quoted symbol
         assert_eq!(parse("\"foo\""), Ok(foo_symbol.clone()));
+        assert_eq!(parse("'foo'"), Ok(foo_symbol.clone()));
         // Parse the "parents" operator
-        assert_eq!(parse("@-"), Ok(wc_symbol.parents()));
+        assert_eq!(parse("foo-"), Ok(foo_symbol.parents()));
         // Parse the "children" operator
-        assert_eq!(parse("@+"), Ok(wc_symbol.children()));
+        assert_eq!(parse("foo+"), Ok(foo_symbol.children()));
         // Parse the "ancestors" operator
-        assert_eq!(parse(":@"), Ok(wc_symbol.ancestors()));
+        assert_eq!(parse("::foo"), Ok(foo_symbol.ancestors()));
         // Parse the "descendants" operator
-        assert_eq!(parse("@:"), Ok(wc_symbol.descendants()));
+        assert_eq!(parse("foo::"), Ok(foo_symbol.descendants()));
         // Parse the "dag range" operator
-        assert_eq!(parse("foo:bar"), Ok(foo_symbol.dag_range_to(&bar_symbol)));
+        assert_eq!(parse("foo::bar"), Ok(foo_symbol.dag_range_to(&bar_symbol)));
+        // Parse the nullary "dag range" operator
+        assert_eq!(parse("::"), Ok(RevsetExpression::all()));
         // Parse the "range" prefix operator
-        assert_eq!(parse("..@"), Ok(wc_symbol.ancestors()));
         assert_eq!(
-            parse("@.."),
-            Ok(wc_symbol.range(&RevsetExpression::visible_heads()))
+            parse("..foo"),
+            Ok(RevsetExpression::root().range(&foo_symbol))
+        );
+        assert_eq!(
+            parse("foo.."),
+            Ok(foo_symbol.range(&RevsetExpression::visible_heads()))
         );
         assert_eq!(parse("foo..bar"), Ok(foo_symbol.range(&bar_symbol)));
+        // Parse the nullary "range" operator
+        assert_eq!(
+            parse(".."),
+            Ok(RevsetExpression::root().range(&RevsetExpression::visible_heads()))
+        );
         // Parse the "negate" operator
         assert_eq!(parse("~ foo"), Ok(foo_symbol.negated()));
         assert_eq!(
@@ -1950,27 +2445,30 @@ mod tests {
         // Parse the "difference" operator
         assert_eq!(parse("foo ~ bar"), Ok(foo_symbol.minus(&bar_symbol)));
         // Parentheses are allowed before suffix operators
-        assert_eq!(parse("(@)-"), Ok(wc_symbol.parents()));
+        assert_eq!(parse("(foo)-"), Ok(foo_symbol.parents()));
         // Space is allowed around expressions
-        assert_eq!(parse(" :@ "), Ok(wc_symbol.ancestors()));
-        assert_eq!(parse("( :@ )"), Ok(wc_symbol.ancestors()));
+        assert_eq!(parse(" ::foo "), Ok(foo_symbol.ancestors()));
+        assert_eq!(parse("( ::foo )"), Ok(foo_symbol.ancestors()));
         // Space is not allowed around prefix operators
-        assert_eq!(parse(" : @ "), Err(RevsetParseErrorKind::SyntaxError));
+        assert_eq!(parse(" :: foo "), Err(RevsetParseErrorKind::SyntaxError));
         // Incomplete parse
         assert_eq!(parse("foo | -"), Err(RevsetParseErrorKind::SyntaxError));
         // Space is allowed around infix operators and function arguments
         assert_eq!(
-            parse("   description(  arg1 ) ~    file(  arg1 ,   arg2 )  ~ heads(  )  "),
-            Ok(
-                RevsetExpression::filter(RevsetFilterPredicate::Description("arg1".to_string()))
-                    .minus(&RevsetExpression::filter(RevsetFilterPredicate::File(
-                        Some(vec![
-                            RepoPath::from_internal_string("arg1"),
-                            RepoPath::from_internal_string("arg2"),
-                        ])
-                    )))
-                    .minus(&RevsetExpression::visible_heads())
-            )
+            parse_with_workspace(
+                "   description(  arg1 ) ~    file(  arg1 ,   arg2 )  ~ visible_heads(  )  ",
+                &main_workspace_id
+            ),
+            Ok(RevsetExpression::filter(RevsetFilterPredicate::Description(
+                StringPattern::Substring("arg1".to_string())
+            ))
+            .minus(&RevsetExpression::filter(RevsetFilterPredicate::File(
+                FilesetExpression::union_all(vec![
+                    FilesetExpression::prefix_path(RepoPathBuf::from_internal_string("arg1")),
+                    FilesetExpression::prefix_path(RepoPathBuf::from_internal_string("arg2")),
+                ])
+            )))
+            .minus(&RevsetExpression::visible_heads()))
         );
         // Space is allowed around keyword arguments
         assert_eq!(
@@ -1986,10 +2484,87 @@ mod tests {
         assert!(parse("branches(,a)").is_err());
         assert!(parse("branches(a,,)").is_err());
         assert!(parse("branches(a  , , )").is_err());
-        assert!(parse("file(a,b,)").is_ok());
-        assert!(parse("file(a,,b)").is_err());
+        assert!(parse_with_workspace("file(a,b,)", &main_workspace_id).is_ok());
+        assert!(parse_with_workspace("file(a,,b)", &main_workspace_id).is_err());
         assert!(parse("remote_branches(a,remote=b  , )").is_ok());
         assert!(parse("remote_branches(a,,remote=b)").is_err());
+    }
+
+    #[test]
+    fn test_parse_revset_with_modifier() {
+        let all_symbol = RevsetExpression::symbol("all".to_owned());
+        let foo_symbol = RevsetExpression::symbol("foo".to_owned());
+
+        // all: is a program modifier, but all:: isn't
+        assert_eq!(
+            parse_with_modifier("all:"),
+            Err(RevsetParseErrorKind::SyntaxError)
+        );
+        assert_eq!(
+            parse_with_modifier("all:foo"),
+            Ok((foo_symbol.clone(), Some(RevsetModifier::All)))
+        );
+        assert_eq!(
+            parse_with_modifier("all::"),
+            Ok((all_symbol.descendants(), None))
+        );
+        assert_eq!(
+            parse_with_modifier("all::foo"),
+            Ok((all_symbol.dag_range_to(&foo_symbol), None))
+        );
+
+        // all::: could be parsed as all:(::), but rejected for simplicity
+        assert_eq!(
+            parse_with_modifier("all:::"),
+            Err(RevsetParseErrorKind::SyntaxError)
+        );
+        assert_eq!(
+            parse_with_modifier("all:::foo"),
+            Err(RevsetParseErrorKind::SyntaxError)
+        );
+
+        assert_eq!(
+            parse_with_modifier("all:(foo)"),
+            Ok((foo_symbol.clone(), Some(RevsetModifier::All)))
+        );
+        assert_eq!(
+            parse_with_modifier("all:all::foo"),
+            Ok((
+                all_symbol.dag_range_to(&foo_symbol),
+                Some(RevsetModifier::All)
+            ))
+        );
+        assert_eq!(
+            parse_with_modifier("all:all | foo"),
+            Ok((all_symbol.union(&foo_symbol), Some(RevsetModifier::All)))
+        );
+
+        assert_eq!(
+            parse_with_modifier("all: ::foo"),
+            Ok((foo_symbol.ancestors(), Some(RevsetModifier::All)))
+        );
+        assert_eq!(
+            parse_with_modifier(" all: foo"),
+            Ok((foo_symbol.clone(), Some(RevsetModifier::All)))
+        );
+        assert_matches!(
+            parse_with_modifier("(all:foo)"),
+            Err(RevsetParseErrorKind::NotInfixOperator { .. })
+        );
+        assert_matches!(
+            parse_with_modifier("all :foo"),
+            Err(RevsetParseErrorKind::SyntaxError)
+        );
+        assert_matches!(
+            parse_with_modifier("all:all:all"),
+            Err(RevsetParseErrorKind::NotInfixOperator { .. })
+        );
+
+        // Top-level string pattern can't be parsed, which is an error anyway
+        assert_eq!(
+            parse_with_modifier(r#"exact:"foo""#),
+            Err(RevsetParseErrorKind::NoSuchModifier("exact".to_owned()))
+        );
     }
 
     #[test]
@@ -2004,8 +2579,120 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_string_literal() {
+        let branches_expr =
+            |s: &str| RevsetExpression::branches(StringPattern::Substring(s.to_owned()));
+
+        // "\<char>" escapes
+        assert_eq!(
+            parse(r#"branches("\t\r\n\"\\\0")"#),
+            Ok(branches_expr("\t\r\n\"\\\0"))
+        );
+
+        // Invalid "\<char>" escape
+        assert_eq!(
+            parse(r#"branches("\y")"#),
+            Err(RevsetParseErrorKind::SyntaxError)
+        );
+
+        // Single-quoted raw string
+        assert_eq!(parse(r#"branches('')"#), Ok(branches_expr("")));
+        assert_eq!(parse(r#"branches('a\n')"#), Ok(branches_expr(r"a\n")));
+        assert_eq!(parse(r#"branches('\')"#), Ok(branches_expr(r"\")));
+        assert_eq!(parse(r#"branches('"')"#), Ok(branches_expr(r#"""#)));
+    }
+
+    #[test]
+    fn test_parse_string_pattern() {
+        assert_eq!(
+            parse(r#"branches("foo")"#),
+            Ok(RevsetExpression::branches(StringPattern::Substring(
+                "foo".to_owned()
+            )))
+        );
+        assert_eq!(
+            parse(r#"branches(exact:"foo")"#),
+            Ok(RevsetExpression::branches(StringPattern::Exact(
+                "foo".to_owned()
+            )))
+        );
+        assert_eq!(
+            parse(r#"branches(substring:"foo")"#),
+            Ok(RevsetExpression::branches(StringPattern::Substring(
+                "foo".to_owned()
+            )))
+        );
+        assert_eq!(
+            parse(r#"branches("exact:foo")"#),
+            Ok(RevsetExpression::branches(StringPattern::Substring(
+                "exact:foo".to_owned()
+            )))
+        );
+        assert_eq!(
+            parse(r#"branches((exact:"foo"))"#),
+            Ok(RevsetExpression::branches(StringPattern::Exact(
+                "foo".to_owned()
+            )))
+        );
+        assert_eq!(
+            parse(r#"branches(exact:'\')"#),
+            Ok(RevsetExpression::branches(StringPattern::Exact(
+                r"\".to_owned()
+            )))
+        );
+        assert_eq!(
+            parse(r#"branches(bad:"foo")"#),
+            Err(RevsetParseErrorKind::InvalidFunctionArguments {
+                name: "branches".to_owned(),
+                message: "Invalid string pattern".to_owned()
+            })
+        );
+        assert_eq!(
+            parse(r#"branches(exact::"foo")"#),
+            Err(RevsetParseErrorKind::InvalidFunctionArguments {
+                name: "branches".to_owned(),
+                message: "Expected function argument of string pattern".to_owned()
+            })
+        );
+        assert_eq!(
+            parse(r#"branches(exact:"foo"+)"#),
+            Err(RevsetParseErrorKind::InvalidFunctionArguments {
+                name: "branches".to_owned(),
+                message: "Expected function argument of string pattern".to_owned()
+            })
+        );
+        assert_matches!(
+            parse(r#"branches(exact:("foo"))"#),
+            Err(RevsetParseErrorKind::NotInfixOperator { .. })
+        );
+
+        // String pattern isn't allowed at top level.
+        assert_matches!(
+            parse(r#"exact:"foo""#),
+            Err(RevsetParseErrorKind::NotInfixOperator { .. })
+        );
+        assert_matches!(
+            parse(r#"(exact:"foo")"#),
+            Err(RevsetParseErrorKind::NotInfixOperator { .. })
+        );
+    }
+
+    #[test]
+    fn test_parse_revset_alias_symbol_decl() {
+        let mut aliases_map = RevsetAliasesMap::new();
+        // Working copy or remote symbol cannot be used as an alias name.
+        assert!(aliases_map.insert("@", "none()").is_err());
+        assert!(aliases_map.insert("a@", "none()").is_err());
+        assert!(aliases_map.insert("a@b", "none()").is_err());
+    }
+
+    #[test]
     fn test_parse_revset_alias_formal_parameter() {
         let mut aliases_map = RevsetAliasesMap::new();
+        // Working copy or remote symbol cannot be used as an parameter name.
+        assert!(aliases_map.insert("f(@)", "none()").is_err());
+        assert!(aliases_map.insert("f(a@)", "none()").is_err());
+        assert!(aliases_map.insert("f(a@b)", "none()").is_err());
         // Trailing comma isn't allowed for empty parameter
         assert!(aliases_map.insert("f(,)", "none()").is_err());
         // Trailing comma is allowed for the last parameter
@@ -2020,6 +2707,14 @@ mod tests {
 
     #[test]
     fn test_parse_revset_compat_operator() {
+        assert_eq!(
+            parse(":foo"),
+            Err(RevsetParseErrorKind::NotPrefixOperator {
+                op: ":".to_owned(),
+                similar_op: "::".to_owned(),
+                description: "ancestors".to_owned(),
+            })
+        );
         assert_eq!(
             parse("foo^"),
             Err(RevsetParseErrorKind::NotPostfixOperator {
@@ -2064,100 +2759,130 @@ mod tests {
         assert_eq!(parse("x&~y").unwrap(), parse("x&(~y)").unwrap());
         assert_eq!(parse("x~~y").unwrap(), parse("x~(~y)").unwrap());
         assert_eq!(parse("x~~~y").unwrap(), parse("x~(~(~y))").unwrap());
-        assert_eq!(parse("~x:y").unwrap(), parse("~(x:y)").unwrap());
+        assert_eq!(parse("~x::y").unwrap(), parse("~(x::y)").unwrap());
         assert_eq!(parse("x|y|z").unwrap(), parse("(x|y)|z").unwrap());
         assert_eq!(parse("x&y|z").unwrap(), parse("(x&y)|z").unwrap());
         assert_eq!(parse("x|y&z").unwrap(), parse("x|(y&z)").unwrap());
         assert_eq!(parse("x|y~z").unwrap(), parse("x|(y~z)").unwrap());
+        assert_eq!(parse("::&..").unwrap(), parse("(::)&(..)").unwrap());
         // Parse repeated "ancestors"/"descendants"/"dag range"/"range" operators
-        assert_eq!(parse(":foo:"), Err(RevsetParseErrorKind::SyntaxError));
-        assert_eq!(parse("::foo"), Err(RevsetParseErrorKind::SyntaxError));
-        assert_eq!(parse("foo::"), Err(RevsetParseErrorKind::SyntaxError));
-        assert_eq!(parse("foo::bar"), Err(RevsetParseErrorKind::SyntaxError));
-        assert_eq!(parse(":foo:bar"), Err(RevsetParseErrorKind::SyntaxError));
-        assert_eq!(parse("foo:bar:"), Err(RevsetParseErrorKind::SyntaxError));
+        assert_eq!(parse("::foo::"), Err(RevsetParseErrorKind::SyntaxError));
+        assert_eq!(parse(":::foo"), Err(RevsetParseErrorKind::SyntaxError));
+        assert_eq!(parse("::::foo"), Err(RevsetParseErrorKind::SyntaxError));
+        assert_eq!(parse("foo:::"), Err(RevsetParseErrorKind::SyntaxError));
+        assert_eq!(parse("foo::::"), Err(RevsetParseErrorKind::SyntaxError));
+        assert_eq!(parse("foo:::bar"), Err(RevsetParseErrorKind::SyntaxError));
+        assert_eq!(parse("foo::::bar"), Err(RevsetParseErrorKind::SyntaxError));
+        assert_eq!(parse("::foo::bar"), Err(RevsetParseErrorKind::SyntaxError));
+        assert_eq!(parse("foo::bar::"), Err(RevsetParseErrorKind::SyntaxError));
+        assert_eq!(parse("::::"), Err(RevsetParseErrorKind::SyntaxError));
         assert_eq!(parse("....foo"), Err(RevsetParseErrorKind::SyntaxError));
         assert_eq!(parse("foo...."), Err(RevsetParseErrorKind::SyntaxError));
         assert_eq!(parse("foo.....bar"), Err(RevsetParseErrorKind::SyntaxError));
         assert_eq!(parse("..foo..bar"), Err(RevsetParseErrorKind::SyntaxError));
         assert_eq!(parse("foo..bar.."), Err(RevsetParseErrorKind::SyntaxError));
+        assert_eq!(parse("...."), Err(RevsetParseErrorKind::SyntaxError));
+        assert_eq!(parse("::.."), Err(RevsetParseErrorKind::SyntaxError));
         // Parse combinations of "parents"/"children" operators and the range operators.
         // The former bind more strongly.
         assert_eq!(parse("foo-+"), Ok(foo_symbol.parents().children()));
-        assert_eq!(parse("foo-:"), Ok(foo_symbol.parents().descendants()));
-        assert_eq!(parse(":foo+"), Ok(foo_symbol.children().ancestors()));
+        assert_eq!(parse("foo-::"), Ok(foo_symbol.parents().descendants()));
+        assert_eq!(parse("::foo+"), Ok(foo_symbol.children().ancestors()));
+        assert_eq!(parse("::-"), Err(RevsetParseErrorKind::SyntaxError));
+        assert_eq!(parse("..+"), Err(RevsetParseErrorKind::SyntaxError));
     }
 
     #[test]
     fn test_parse_revset_function() {
-        let wc_symbol = RevsetExpression::symbol("@".to_string());
-        assert_eq!(parse("parents(@)"), Ok(wc_symbol.parents()));
-        assert_eq!(parse("parents((@))"), Ok(wc_symbol.parents()));
-        assert_eq!(parse("parents(\"@\")"), Ok(wc_symbol.parents()));
+        let foo_symbol = RevsetExpression::symbol("foo".to_string());
+        assert_eq!(parse("parents(foo)"), Ok(foo_symbol.parents()));
+        assert_eq!(parse("parents((foo))"), Ok(foo_symbol.parents()));
+        assert_eq!(parse("parents(\"foo\")"), Ok(foo_symbol.parents()));
         assert_eq!(
-            parse("ancestors(parents(@))"),
-            Ok(wc_symbol.parents().ancestors())
+            parse("ancestors(parents(foo))"),
+            Ok(foo_symbol.parents().ancestors())
         );
-        assert_eq!(parse("parents(@"), Err(RevsetParseErrorKind::SyntaxError));
+        assert_eq!(parse("parents(foo"), Err(RevsetParseErrorKind::SyntaxError));
         assert_eq!(
-            parse("parents(@,@)"),
+            parse("parents(foo,foo)"),
             Err(RevsetParseErrorKind::InvalidFunctionArguments {
                 name: "parents".to_string(),
                 message: "Expected 1 arguments".to_string()
             })
         );
         assert_eq!(
+            parse("root()"),
+            Ok(Rc::new(RevsetExpression::CommitRef(RevsetCommitRef::Root)))
+        );
+        assert!(parse("root(a)").is_err());
+        assert_eq!(
             parse(r#"description("")"#),
             Ok(RevsetExpression::filter(
-                RevsetFilterPredicate::Description("".to_string())
+                RevsetFilterPredicate::Description(StringPattern::Substring("".to_string()))
             ))
         );
         assert_eq!(
             parse("description(foo)"),
             Ok(RevsetExpression::filter(
-                RevsetFilterPredicate::Description("foo".to_string())
+                RevsetFilterPredicate::Description(StringPattern::Substring("foo".to_string()))
             ))
         );
         assert_eq!(
-            parse("description(heads())"),
+            parse("description(visible_heads())"),
             Err(RevsetParseErrorKind::InvalidFunctionArguments {
                 name: "description".to_string(),
-                message: "Expected function argument of type string".to_string()
+                message: "Expected function argument of string pattern".to_string()
             })
         );
         assert_eq!(
             parse("description((foo))"),
             Ok(RevsetExpression::filter(
-                RevsetFilterPredicate::Description("foo".to_string())
+                RevsetFilterPredicate::Description(StringPattern::Substring("foo".to_string()))
             ))
         );
         assert_eq!(
             parse("description(\"(foo)\")"),
             Ok(RevsetExpression::filter(
-                RevsetFilterPredicate::Description("(foo)".to_string())
+                RevsetFilterPredicate::Description(StringPattern::Substring("(foo)".to_string()))
             ))
         );
+        assert!(parse("mine(foo)").is_err());
         assert_eq!(
-            parse("empty()"),
-            Ok(RevsetExpression::filter(RevsetFilterPredicate::File(None)).negated())
-        );
-        assert!(parse("empty(foo)").is_err());
-        assert!(parse("file()").is_err());
-        assert_eq!(
-            parse("file(foo)"),
-            Ok(RevsetExpression::filter(RevsetFilterPredicate::File(Some(
-                vec![RepoPath::from_internal_string("foo")]
-            ))))
+            parse("mine()"),
+            Ok(RevsetExpression::filter(RevsetFilterPredicate::Author(
+                StringPattern::Exact("test.user@example.com".to_string())
+            )))
         );
         assert_eq!(
-            parse("file(foo, bar, baz)"),
-            Ok(RevsetExpression::filter(RevsetFilterPredicate::File(Some(
-                vec![
-                    RepoPath::from_internal_string("foo"),
-                    RepoPath::from_internal_string("bar"),
-                    RepoPath::from_internal_string("baz"),
-                ]
-            ))))
+            parse_with_workspace("empty()", &WorkspaceId::default()),
+            Ok(
+                RevsetExpression::filter(RevsetFilterPredicate::File(FilesetExpression::all()))
+                    .negated()
+            )
+        );
+        assert!(parse_with_workspace("empty(foo)", &WorkspaceId::default()).is_err());
+        assert!(parse_with_workspace("file()", &WorkspaceId::default()).is_err());
+        assert_eq!(
+            parse_with_workspace("file(foo)", &WorkspaceId::default()),
+            Ok(RevsetExpression::filter(RevsetFilterPredicate::File(
+                FilesetExpression::prefix_path(RepoPathBuf::from_internal_string("foo"))
+            )))
+        );
+        assert_eq!(
+            parse_with_workspace(r#"file(file:"foo")"#, &WorkspaceId::default()),
+            Ok(RevsetExpression::filter(RevsetFilterPredicate::File(
+                FilesetExpression::file_path(RepoPathBuf::from_internal_string("foo"))
+            )))
+        );
+        assert_eq!(
+            parse_with_workspace("file(foo, bar, baz)", &WorkspaceId::default()),
+            Ok(RevsetExpression::filter(RevsetFilterPredicate::File(
+                FilesetExpression::union_all(vec![
+                    FilesetExpression::prefix_path(RepoPathBuf::from_internal_string("foo")),
+                    FilesetExpression::prefix_path(RepoPathBuf::from_internal_string("bar")),
+                    FilesetExpression::prefix_path(RepoPathBuf::from_internal_string("baz")),
+                ])
+            )))
         );
     }
 
@@ -2212,8 +2937,8 @@ mod tests {
             parse("(a|b)|c").unwrap()
         );
         assert_eq!(
-            parse_with_aliases("AB:heads(AB)", [("AB", "a|b")]).unwrap(),
-            parse("(a|b):heads(a|b)").unwrap()
+            parse_with_aliases("AB::heads(AB)", [("AB", "a|b")]).unwrap(),
+            parse("(a|b)::heads(a|b)").unwrap()
         );
 
         // Not string substitution 'a&b|c', but tree substitution.
@@ -2224,14 +2949,51 @@ mod tests {
 
         // String literal should not be substituted with alias.
         assert_eq!(
-            parse_with_aliases(r#"A|"A""#, [("A", "a")]).unwrap(),
-            parse("a|A").unwrap()
+            parse_with_aliases(r#"A|"A"|'A'"#, [("A", "a")]).unwrap(),
+            parse("a|A|A").unwrap()
         );
 
         // Alias can be substituted to string literal.
         assert_eq!(
+            parse_with_aliases_and_workspace("file(A)", [("A", "a")], &WorkspaceId::default())
+                .unwrap(),
+            parse_with_workspace("file(a)", &WorkspaceId::default()).unwrap()
+        );
+
+        // Alias can be substituted to string pattern.
+        assert_eq!(
             parse_with_aliases("author(A)", [("A", "a")]).unwrap(),
             parse("author(a)").unwrap()
+        );
+        assert_eq!(
+            parse_with_aliases("author(A)", [("A", "exact:a")]).unwrap(),
+            parse("author(exact:a)").unwrap()
+        );
+
+        // Part of string pattern cannot be substituted.
+        assert_eq!(
+            parse_with_aliases("author(exact:A)", [("A", "a")]).unwrap(),
+            parse("author(exact:A)").unwrap()
+        );
+
+        // Part of @ symbol cannot be substituted.
+        assert_eq!(
+            parse_with_aliases("A@", [("A", "a")]).unwrap(),
+            parse("A@").unwrap()
+        );
+        assert_eq!(
+            parse_with_aliases("A@b", [("A", "a")]).unwrap(),
+            parse("A@b").unwrap()
+        );
+        assert_eq!(
+            parse_with_aliases("a@B", [("B", "b")]).unwrap(),
+            parse("a@B").unwrap()
+        );
+
+        // Modifier cannot be substituted.
+        assert_eq!(
+            parse_with_aliases_and_modifier("all:all", [("all", "ALL")]).unwrap(),
+            parse_with_modifier("all:ALL").unwrap()
         );
 
         // Multi-level substitution.
@@ -2255,6 +3017,11 @@ mod tests {
             parse_with_aliases("A", [("A", "a(")]),
             Err(RevsetParseErrorKind::BadAliasExpansion("A".to_owned()))
         );
+        // Modifier isn't allowed in alias definition.
+        assert_eq!(
+            parse_with_aliases_and_modifier("A", [("A", "all:a")]),
+            Err(RevsetParseErrorKind::BadAliasExpansion("A".to_owned()))
+        );
     }
 
     #[test]
@@ -2274,8 +3041,8 @@ mod tests {
 
         // Arguments should be resolved in the current scope.
         assert_eq!(
-            parse_with_aliases("F(a:y,b:x)", [("F(x,y)", "x|y")]).unwrap(),
-            parse("(a:y)|(b:x)").unwrap()
+            parse_with_aliases("F(a::y,b::x)", [("F(x,y)", "x|y")]).unwrap(),
+            parse("(a::y)|(b::x)").unwrap()
         );
         // F(a) -> G(a)&y -> (x|a)&y
         assert_eq!(
@@ -2367,75 +3134,78 @@ mod tests {
 
         assert_eq!(
             optimize(parse("parents(branches() & all())").unwrap()),
-            RevsetExpression::branches("".to_owned()).parents()
+            RevsetExpression::branches(StringPattern::everything()).parents()
         );
         assert_eq!(
             optimize(parse("children(branches() & all())").unwrap()),
-            RevsetExpression::branches("".to_owned()).children()
+            RevsetExpression::branches(StringPattern::everything()).children()
         );
         assert_eq!(
             optimize(parse("ancestors(branches() & all())").unwrap()),
-            RevsetExpression::branches("".to_owned()).ancestors()
+            RevsetExpression::branches(StringPattern::everything()).ancestors()
         );
         assert_eq!(
             optimize(parse("descendants(branches() & all())").unwrap()),
-            RevsetExpression::branches("".to_owned()).descendants()
+            RevsetExpression::branches(StringPattern::everything()).descendants()
         );
 
         assert_eq!(
             optimize(parse("(branches() & all())..(all() & tags())").unwrap()),
-            RevsetExpression::branches("".to_owned()).range(&RevsetExpression::tags())
+            RevsetExpression::branches(StringPattern::everything())
+                .range(&RevsetExpression::tags())
         );
         assert_eq!(
-            optimize(parse("(branches() & all()):(all() & tags())").unwrap()),
-            RevsetExpression::branches("".to_owned()).dag_range_to(&RevsetExpression::tags())
+            optimize(parse("(branches() & all())::(all() & tags())").unwrap()),
+            RevsetExpression::branches(StringPattern::everything())
+                .dag_range_to(&RevsetExpression::tags())
         );
 
         assert_eq!(
             optimize(parse("heads(branches() & all())").unwrap()),
-            RevsetExpression::branches("".to_owned()).heads()
+            RevsetExpression::branches(StringPattern::everything()).heads()
         );
         assert_eq!(
             optimize(parse("roots(branches() & all())").unwrap()),
-            RevsetExpression::branches("".to_owned()).roots()
+            RevsetExpression::branches(StringPattern::everything()).roots()
         );
 
         assert_eq!(
             optimize(parse("latest(branches() & all(), 2)").unwrap()),
-            RevsetExpression::branches("".to_owned()).latest(2)
+            RevsetExpression::branches(StringPattern::everything()).latest(2)
         );
 
         assert_eq!(
-            optimize(parse("present(author(foo) ~ bar)").unwrap()),
-            Rc::new(RevsetExpression::AsFilter(Rc::new(
-                RevsetExpression::Present(
-                    RevsetExpression::filter(RevsetFilterPredicate::Author("foo".to_owned()))
-                        .minus(&RevsetExpression::symbol("bar".to_owned()))
-                )
-            )))
+            optimize(parse("present(foo ~ bar)").unwrap()),
+            Rc::new(RevsetExpression::Present(
+                RevsetExpression::symbol("foo".to_owned())
+                    .minus(&RevsetExpression::symbol("bar".to_owned()))
+            ))
         );
         assert_eq!(
             optimize(parse("present(branches() & all())").unwrap()),
             Rc::new(RevsetExpression::Present(RevsetExpression::branches(
-                "".to_owned()
+                StringPattern::everything()
             )))
         );
 
         assert_eq!(
             optimize(parse("~branches() & all()").unwrap()),
-            RevsetExpression::branches("".to_owned()).negated()
+            RevsetExpression::branches(StringPattern::everything()).negated()
         );
         assert_eq!(
             optimize(parse("(branches() & all()) | (all() & tags())").unwrap()),
-            RevsetExpression::branches("".to_owned()).union(&RevsetExpression::tags())
+            RevsetExpression::branches(StringPattern::everything())
+                .union(&RevsetExpression::tags())
         );
         assert_eq!(
             optimize(parse("(branches() & all()) & (all() & tags())").unwrap()),
-            RevsetExpression::branches("".to_owned()).intersection(&RevsetExpression::tags())
+            RevsetExpression::branches(StringPattern::everything())
+                .intersection(&RevsetExpression::tags())
         );
         assert_eq!(
             optimize(parse("(branches() & all()) ~ (all() & tags())").unwrap()),
-            RevsetExpression::branches("".to_owned()).minus(&RevsetExpression::tags())
+            RevsetExpression::branches(StringPattern::everything())
+                .minus(&RevsetExpression::tags())
         );
     }
 
@@ -2468,7 +3238,7 @@ mod tests {
         let optimized = optimize(parsed.clone());
         assert_eq!(
             unwrap_union(&optimized).0.as_ref(),
-            &RevsetExpression::Branches("".to_owned())
+            &RevsetExpression::CommitRef(RevsetCommitRef::Branches(StringPattern::everything()))
         );
         assert!(Rc::ptr_eq(
             unwrap_union(&parsed).1,
@@ -2482,53 +3252,74 @@ mod tests {
             unwrap_union(&parsed).0,
             unwrap_union(&optimized).0
         ));
-        assert_eq!(unwrap_union(&optimized).1.as_ref(), &RevsetExpression::Tags);
+        assert_eq!(
+            unwrap_union(&optimized).1.as_ref(),
+            &RevsetExpression::CommitRef(RevsetCommitRef::Tags),
+        );
     }
 
     #[test]
     fn test_optimize_difference() {
         insta::assert_debug_snapshot!(optimize(parse("foo & ~bar").unwrap()), @r###"
         Difference(
-            Symbol(
-                "foo",
+            CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
-            Symbol(
-                "bar",
+            CommitRef(
+                Symbol(
+                    "bar",
+                ),
             ),
         )
         "###);
         insta::assert_debug_snapshot!(optimize(parse("~foo & bar").unwrap()), @r###"
         Difference(
-            Symbol(
-                "bar",
+            CommitRef(
+                Symbol(
+                    "bar",
+                ),
             ),
-            Symbol(
-                "foo",
+            CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
         )
         "###);
         insta::assert_debug_snapshot!(optimize(parse("~foo & bar & ~baz").unwrap()), @r###"
         Difference(
             Difference(
-                Symbol(
-                    "bar",
+                CommitRef(
+                    Symbol(
+                        "bar",
+                    ),
                 ),
-                Symbol(
-                    "foo",
+                CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
                 ),
             ),
-            Symbol(
-                "baz",
+            CommitRef(
+                Symbol(
+                    "baz",
+                ),
             ),
         )
         "###);
         insta::assert_debug_snapshot!(optimize(parse("(all() & ~foo) & bar").unwrap()), @r###"
         Difference(
-            Symbol(
-                "bar",
+            CommitRef(
+                Symbol(
+                    "bar",
+                ),
             ),
-            Symbol(
-                "foo",
+            CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
         )
         "###);
@@ -2536,104 +3327,142 @@ mod tests {
         // Binary difference operation should go through the same optimization passes.
         insta::assert_debug_snapshot!(optimize(parse("all() ~ foo").unwrap()), @r###"
         NotIn(
-            Symbol(
-                "foo",
+            CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
         )
         "###);
         insta::assert_debug_snapshot!(optimize(parse("foo ~ bar").unwrap()), @r###"
         Difference(
-            Symbol(
-                "foo",
+            CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
-            Symbol(
-                "bar",
+            CommitRef(
+                Symbol(
+                    "bar",
+                ),
             ),
         )
         "###);
         insta::assert_debug_snapshot!(optimize(parse("(all() ~ foo) & bar").unwrap()), @r###"
         Difference(
-            Symbol(
-                "bar",
+            CommitRef(
+                Symbol(
+                    "bar",
+                ),
             ),
-            Symbol(
-                "foo",
+            CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
         )
         "###);
 
         // Range expression.
-        insta::assert_debug_snapshot!(optimize(parse(":foo & ~:bar").unwrap()), @r###"
+        insta::assert_debug_snapshot!(optimize(parse("::foo & ~::bar").unwrap()), @r###"
         Range {
-            roots: Symbol(
-                "bar",
+            roots: CommitRef(
+                Symbol(
+                    "bar",
+                ),
             ),
-            heads: Symbol(
-                "foo",
+            heads: CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
-            generation: 0..4294967295,
+            generation: 0..18446744073709551615,
         }
         "###);
-        insta::assert_debug_snapshot!(optimize(parse("~:foo & :bar").unwrap()), @r###"
+        insta::assert_debug_snapshot!(optimize(parse("~::foo & ::bar").unwrap()), @r###"
         Range {
-            roots: Symbol(
-                "foo",
+            roots: CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
-            heads: Symbol(
-                "bar",
+            heads: CommitRef(
+                Symbol(
+                    "bar",
+                ),
             ),
-            generation: 0..4294967295,
+            generation: 0..18446744073709551615,
         }
         "###);
         insta::assert_debug_snapshot!(optimize(parse("foo..").unwrap()), @r###"
         Range {
-            roots: Symbol(
-                "foo",
+            roots: CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
-            heads: VisibleHeads,
-            generation: 0..4294967295,
+            heads: CommitRef(
+                VisibleHeads,
+            ),
+            generation: 0..18446744073709551615,
         }
         "###);
         insta::assert_debug_snapshot!(optimize(parse("foo..bar").unwrap()), @r###"
         Range {
-            roots: Symbol(
-                "foo",
+            roots: CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
-            heads: Symbol(
-                "bar",
+            heads: CommitRef(
+                Symbol(
+                    "bar",
+                ),
             ),
-            generation: 0..4294967295,
+            generation: 0..18446744073709551615,
         }
         "###);
 
         // Double/triple negates.
         insta::assert_debug_snapshot!(optimize(parse("foo & ~~bar").unwrap()), @r###"
         Intersection(
-            Symbol(
-                "foo",
+            CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
-            Symbol(
-                "bar",
+            CommitRef(
+                Symbol(
+                    "bar",
+                ),
             ),
         )
         "###);
         insta::assert_debug_snapshot!(optimize(parse("foo & ~~~bar").unwrap()), @r###"
         Difference(
-            Symbol(
-                "foo",
+            CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
-            Symbol(
-                "bar",
+            CommitRef(
+                Symbol(
+                    "bar",
+                ),
             ),
         )
         "###);
         insta::assert_debug_snapshot!(optimize(parse("~(all() & ~foo) & bar").unwrap()), @r###"
         Intersection(
-            Symbol(
-                "foo",
+            CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
-            Symbol(
-                "bar",
+            CommitRef(
+                Symbol(
+                    "bar",
+                ),
             ),
         )
         "###);
@@ -2642,13 +3471,95 @@ mod tests {
         insta::assert_debug_snapshot!(optimize(parse("~foo & ~bar").unwrap()), @r###"
         Difference(
             NotIn(
+                CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
+                ),
+            ),
+            CommitRef(
+                Symbol(
+                    "bar",
+                ),
+            ),
+        )
+        "###);
+    }
+
+    #[test]
+    fn test_optimize_not_in_ancestors() {
+        // '~(::foo)' is equivalent to 'foo..'.
+        insta::assert_debug_snapshot!(optimize(parse("~(::foo)").unwrap()), @r###"
+        Range {
+            roots: CommitRef(
                 Symbol(
                     "foo",
                 ),
             ),
-            Symbol(
-                "bar",
+            heads: CommitRef(
+                VisibleHeads,
             ),
+            generation: 0..18446744073709551615,
+        }
+        "###);
+
+        // '~(::foo-)' is equivalent to 'foo-..'.
+        insta::assert_debug_snapshot!(optimize(parse("~(::foo-)").unwrap()), @r###"
+        Range {
+            roots: Ancestors {
+                heads: CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
+                ),
+                generation: 1..2,
+            },
+            heads: CommitRef(
+                VisibleHeads,
+            ),
+            generation: 0..18446744073709551615,
+        }
+        "###);
+        insta::assert_debug_snapshot!(optimize(parse("~(::foo--)").unwrap()), @r###"
+        Range {
+            roots: Ancestors {
+                heads: CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
+                ),
+                generation: 2..3,
+            },
+            heads: CommitRef(
+                VisibleHeads,
+            ),
+            generation: 0..18446744073709551615,
+        }
+        "###);
+
+        // Bounded ancestors shouldn't be substituted.
+        insta::assert_debug_snapshot!(optimize(parse("~ancestors(foo, 1)").unwrap()), @r###"
+        NotIn(
+            Ancestors {
+                heads: CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
+                ),
+                generation: 0..1,
+            },
+        )
+        "###);
+        insta::assert_debug_snapshot!(optimize(parse("~ancestors(foo-, 1)").unwrap()), @r###"
+        NotIn(
+            Ancestors {
+                heads: CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
+                ),
+                generation: 1..2,
+            },
         )
         "###);
     }
@@ -2659,7 +3570,7 @@ mod tests {
         insta::assert_debug_snapshot!(optimize(parse("~empty()").unwrap()), @r###"
         Filter(
             File(
-                None,
+                All,
             ),
         )
         "###);
@@ -2669,20 +3580,96 @@ mod tests {
             optimize(parse("(author(foo) & ~bar) & baz").unwrap()), @r###"
         Intersection(
             Difference(
-                Symbol(
-                    "baz",
+                CommitRef(
+                    Symbol(
+                        "baz",
+                    ),
                 ),
-                Symbol(
-                    "bar",
+                CommitRef(
+                    Symbol(
+                        "bar",
+                    ),
                 ),
             ),
             Filter(
                 Author(
-                    "foo",
+                    Substring(
+                        "foo",
+                    ),
                 ),
             ),
         )
-        "###)
+        "###);
+
+        // '~set & filter()' shouldn't be substituted.
+        insta::assert_debug_snapshot!(
+            optimize(parse("~foo & author(bar)").unwrap()), @r###"
+        Intersection(
+            NotIn(
+                CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
+                ),
+            ),
+            Filter(
+                Author(
+                    Substring(
+                        "bar",
+                    ),
+                ),
+            ),
+        )
+        "###);
+        insta::assert_debug_snapshot!(
+            optimize(parse("~foo & (author(bar) | baz)").unwrap()), @r###"
+        Intersection(
+            NotIn(
+                CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
+                ),
+            ),
+            AsFilter(
+                Union(
+                    Filter(
+                        Author(
+                            Substring(
+                                "bar",
+                            ),
+                        ),
+                    ),
+                    CommitRef(
+                        Symbol(
+                            "baz",
+                        ),
+                    ),
+                ),
+            ),
+        )
+        "###);
+
+        // Filter should be moved right of the intersection.
+        insta::assert_debug_snapshot!(
+            optimize(parse("author(foo) ~ bar").unwrap()), @r###"
+        Intersection(
+            NotIn(
+                CommitRef(
+                    Symbol(
+                        "bar",
+                    ),
+                ),
+            ),
+            Filter(
+                Author(
+                    Substring(
+                        "foo",
+                    ),
+                ),
+            ),
+        )
+        "###);
     }
 
     #[test]
@@ -2690,31 +3677,41 @@ mod tests {
         insta::assert_debug_snapshot!(optimize(parse("author(foo)").unwrap()), @r###"
         Filter(
             Author(
-                "foo",
+                Substring(
+                    "foo",
+                ),
             ),
         )
         "###);
 
         insta::assert_debug_snapshot!(optimize(parse("foo & description(bar)").unwrap()), @r###"
         Intersection(
-            Symbol(
-                "foo",
+            CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
             Filter(
                 Description(
-                    "bar",
+                    Substring(
+                        "bar",
+                    ),
                 ),
             ),
         )
         "###);
         insta::assert_debug_snapshot!(optimize(parse("author(foo) & bar").unwrap()), @r###"
         Intersection(
-            Symbol(
-                "bar",
+            CommitRef(
+                Symbol(
+                    "bar",
+                ),
             ),
             Filter(
                 Author(
-                    "foo",
+                    Substring(
+                        "foo",
+                    ),
                 ),
             ),
         )
@@ -2724,12 +3721,16 @@ mod tests {
         Intersection(
             Filter(
                 Author(
-                    "foo",
+                    Substring(
+                        "foo",
+                    ),
                 ),
             ),
             Filter(
                 Committer(
-                    "bar",
+                    Substring(
+                        "bar",
+                    ),
                 ),
             ),
         )
@@ -2739,18 +3740,24 @@ mod tests {
             optimize(parse("foo & description(bar) & author(baz)").unwrap()), @r###"
         Intersection(
             Intersection(
-                Symbol(
-                    "foo",
+                CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
                 ),
                 Filter(
                     Description(
-                        "bar",
+                        Substring(
+                            "bar",
+                        ),
                     ),
                 ),
             ),
             Filter(
                 Author(
-                    "baz",
+                    Substring(
+                        "baz",
+                    ),
                 ),
             ),
         )
@@ -2759,88 +3766,106 @@ mod tests {
             optimize(parse("committer(foo) & bar & author(baz)").unwrap()), @r###"
         Intersection(
             Intersection(
-                Symbol(
-                    "bar",
+                CommitRef(
+                    Symbol(
+                        "bar",
+                    ),
                 ),
                 Filter(
                     Committer(
-                        "foo",
-                    ),
-                ),
-            ),
-            Filter(
-                Author(
-                    "baz",
-                ),
-            ),
-        )
-        "###);
-        insta::assert_debug_snapshot!(
-            optimize(parse("committer(foo) & file(bar) & baz").unwrap()), @r###"
-        Intersection(
-            Intersection(
-                Symbol(
-                    "baz",
-                ),
-                Filter(
-                    Committer(
-                        "foo",
-                    ),
-                ),
-            ),
-            Filter(
-                File(
-                    Some(
-                        [
-                            "bar",
-                        ],
-                    ),
-                ),
-            ),
-        )
-        "###);
-        insta::assert_debug_snapshot!(
-            optimize(parse("committer(foo) & file(bar) & author(baz)").unwrap()), @r###"
-        Intersection(
-            Intersection(
-                Filter(
-                    Committer(
-                        "foo",
-                    ),
-                ),
-                Filter(
-                    File(
-                        Some(
-                            [
-                                "bar",
-                            ],
+                        Substring(
+                            "foo",
                         ),
                     ),
                 ),
             ),
             Filter(
                 Author(
-                    "baz",
+                    Substring(
+                        "baz",
+                    ),
                 ),
             ),
         )
         "###);
-        insta::assert_debug_snapshot!(optimize(parse("foo & file(bar) & baz").unwrap()), @r###"
+        insta::assert_debug_snapshot!(
+            optimize(parse_with_workspace("committer(foo) & file(bar) & baz", &WorkspaceId::default()).unwrap()), @r###"
         Intersection(
             Intersection(
-                Symbol(
-                    "foo",
+                CommitRef(
+                    Symbol(
+                        "baz",
+                    ),
                 ),
-                Symbol(
-                    "baz",
+                Filter(
+                    Committer(
+                        Substring(
+                            "foo",
+                        ),
+                    ),
                 ),
             ),
             Filter(
                 File(
-                    Some(
-                        [
+                    Pattern(
+                        PrefixPath(
                             "bar",
-                        ],
+                        ),
+                    ),
+                ),
+            ),
+        )
+        "###);
+        insta::assert_debug_snapshot!(
+            optimize(parse_with_workspace("committer(foo) & file(bar) & author(baz)", &WorkspaceId::default()).unwrap()), @r###"
+        Intersection(
+            Intersection(
+                Filter(
+                    Committer(
+                        Substring(
+                            "foo",
+                        ),
+                    ),
+                ),
+                Filter(
+                    File(
+                        Pattern(
+                            PrefixPath(
+                                "bar",
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+            Filter(
+                Author(
+                    Substring(
+                        "baz",
+                    ),
+                ),
+            ),
+        )
+        "###);
+        insta::assert_debug_snapshot!(optimize(parse_with_workspace("foo & file(bar) & baz", &WorkspaceId::default()).unwrap()), @r###"
+        Intersection(
+            Intersection(
+                CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
+                ),
+                CommitRef(
+                    Symbol(
+                        "baz",
+                    ),
+                ),
+            ),
+            Filter(
+                File(
+                    Pattern(
+                        PrefixPath(
+                            "bar",
+                        ),
                     ),
                 ),
             ),
@@ -2852,22 +3877,30 @@ mod tests {
         Intersection(
             Intersection(
                 Intersection(
-                    Symbol(
-                        "foo",
+                    CommitRef(
+                        Symbol(
+                            "foo",
+                        ),
                     ),
-                    Symbol(
-                        "qux",
+                    CommitRef(
+                        Symbol(
+                            "qux",
+                        ),
                     ),
                 ),
                 Filter(
                     Description(
-                        "bar",
+                        Substring(
+                            "bar",
+                        ),
                     ),
                 ),
             ),
             Filter(
                 Author(
-                    "baz",
+                    Substring(
+                        "baz",
+                    ),
                 ),
             ),
         )
@@ -2877,25 +3910,33 @@ mod tests {
         Intersection(
             Intersection(
                 Intersection(
-                    Symbol(
-                        "foo",
+                    CommitRef(
+                        Symbol(
+                            "foo",
+                        ),
                     ),
                     Ancestors {
                         heads: Filter(
                             Author(
-                                "baz",
+                                Substring(
+                                    "baz",
+                                ),
                             ),
                         ),
                         generation: 1..2,
                     },
                 ),
-                Symbol(
-                    "qux",
+                CommitRef(
+                    Symbol(
+                        "qux",
+                    ),
                 ),
             ),
             Filter(
                 Description(
-                    "bar",
+                    Substring(
+                        "bar",
+                    ),
                 ),
             ),
         )
@@ -2904,17 +3945,23 @@ mod tests {
             optimize(parse("foo & description(bar) & parents(author(baz) & qux)").unwrap()), @r###"
         Intersection(
             Intersection(
-                Symbol(
-                    "foo",
+                CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
                 ),
                 Ancestors {
                     heads: Intersection(
-                        Symbol(
-                            "qux",
+                        CommitRef(
+                            Symbol(
+                                "qux",
+                            ),
                         ),
                         Filter(
                             Author(
-                                "baz",
+                                Substring(
+                                    "baz",
+                                ),
                             ),
                         ),
                     ),
@@ -2923,7 +3970,9 @@ mod tests {
             ),
             Filter(
                 Description(
-                    "bar",
+                    Substring(
+                        "bar",
+                    ),
                 ),
             ),
         )
@@ -2937,32 +3986,44 @@ mod tests {
                 Intersection(
                     Intersection(
                         Intersection(
-                            Symbol(
-                                "a",
+                            CommitRef(
+                                Symbol(
+                                    "a",
+                                ),
                             ),
-                            Symbol(
-                                "b",
+                            CommitRef(
+                                Symbol(
+                                    "b",
+                                ),
                             ),
                         ),
-                        Symbol(
-                            "c",
+                        CommitRef(
+                            Symbol(
+                                "c",
+                            ),
                         ),
                     ),
                     Filter(
                         Author(
-                            "A",
+                            Substring(
+                                "A",
+                            ),
                         ),
                     ),
                 ),
                 Filter(
                     Author(
-                        "B",
+                        Substring(
+                            "B",
+                        ),
                     ),
                 ),
             ),
             Filter(
                 Author(
-                    "C",
+                    Substring(
+                        "C",
+                    ),
                 ),
             ),
         )
@@ -2975,37 +4036,51 @@ mod tests {
                 Intersection(
                     Intersection(
                         Intersection(
-                            Symbol(
-                                "a",
+                            CommitRef(
+                                Symbol(
+                                    "a",
+                                ),
                             ),
                             Intersection(
-                                Symbol(
-                                    "b",
+                                CommitRef(
+                                    Symbol(
+                                        "b",
+                                    ),
                                 ),
-                                Symbol(
-                                    "c",
+                                CommitRef(
+                                    Symbol(
+                                        "c",
+                                    ),
                                 ),
                             ),
                         ),
-                        Symbol(
-                            "d",
+                        CommitRef(
+                            Symbol(
+                                "d",
+                            ),
                         ),
                     ),
                     Filter(
                         Author(
-                            "A",
+                            Substring(
+                                "A",
+                            ),
                         ),
                     ),
                 ),
                 Filter(
                     Author(
-                        "B",
+                        Substring(
+                            "B",
+                        ),
                     ),
                 ),
             ),
             Filter(
                 Author(
-                    "C",
+                    Substring(
+                        "C",
+                    ),
                 ),
             ),
         )
@@ -3017,18 +4092,24 @@ mod tests {
             @r###"
         Intersection(
             Intersection(
-                Symbol(
-                    "foo",
+                CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
                 ),
                 Filter(
                     Description(
-                        "bar",
+                        Substring(
+                            "bar",
+                        ),
                     ),
                 ),
             ),
             Filter(
                 Author(
-                    "baz",
+                    Substring(
+                        "baz",
+                    ),
                 ),
             ),
         )
@@ -3040,18 +4121,24 @@ mod tests {
         insta::assert_debug_snapshot!(
             optimize(parse("(author(foo) | bar) & baz").unwrap()), @r###"
         Intersection(
-            Symbol(
-                "baz",
+            CommitRef(
+                Symbol(
+                    "baz",
+                ),
             ),
             AsFilter(
                 Union(
                     Filter(
                         Author(
-                            "foo",
+                            Substring(
+                                "foo",
+                            ),
                         ),
                     ),
-                    Symbol(
-                        "bar",
+                    CommitRef(
+                        Symbol(
+                            "bar",
+                        ),
                     ),
                 ),
             ),
@@ -3062,17 +4149,23 @@ mod tests {
             optimize(parse("(foo | committer(bar)) & description(baz) & qux").unwrap()), @r###"
         Intersection(
             Intersection(
-                Symbol(
-                    "qux",
+                CommitRef(
+                    Symbol(
+                        "qux",
+                    ),
                 ),
                 AsFilter(
                     Union(
-                        Symbol(
-                            "foo",
+                        CommitRef(
+                            Symbol(
+                                "foo",
+                            ),
                         ),
                         Filter(
                             Committer(
-                                "bar",
+                                Substring(
+                                    "bar",
+                                ),
                             ),
                         ),
                     ),
@@ -3080,7 +4173,9 @@ mod tests {
             ),
             Filter(
                 Description(
-                    "baz",
+                    Substring(
+                        "baz",
+                    ),
                 ),
             ),
         )
@@ -3089,8 +4184,10 @@ mod tests {
         insta::assert_debug_snapshot!(
             optimize(parse("(~present(author(foo) & bar) | baz) & qux").unwrap()), @r###"
         Intersection(
-            Symbol(
-                "qux",
+            CommitRef(
+                Symbol(
+                    "qux",
+                ),
             ),
             AsFilter(
                 Union(
@@ -3099,12 +4196,16 @@ mod tests {
                             AsFilter(
                                 Present(
                                     Intersection(
-                                        Symbol(
-                                            "bar",
+                                        CommitRef(
+                                            Symbol(
+                                                "bar",
+                                            ),
                                         ),
                                         Filter(
                                             Author(
-                                                "foo",
+                                                Substring(
+                                                    "foo",
+                                                ),
                                             ),
                                         ),
                                     ),
@@ -3112,8 +4213,10 @@ mod tests {
                             ),
                         ),
                     ),
-                    Symbol(
-                        "baz",
+                    CommitRef(
+                        Symbol(
+                            "baz",
+                        ),
                     ),
                 ),
             ),
@@ -3130,26 +4233,36 @@ mod tests {
                 Intersection(
                     Intersection(
                         Intersection(
-                            Symbol(
-                                "a",
+                            CommitRef(
+                                Symbol(
+                                    "a",
+                                ),
                             ),
-                            Symbol(
-                                "b",
+                            CommitRef(
+                                Symbol(
+                                    "b",
+                                ),
                             ),
                         ),
-                        Symbol(
-                            "c",
+                        CommitRef(
+                            Symbol(
+                                "c",
+                            ),
                         ),
                     ),
                     AsFilter(
                         Union(
                             Filter(
                                 Author(
-                                    "A",
+                                    Substring(
+                                        "A",
+                                    ),
                                 ),
                             ),
-                            Symbol(
-                                "0",
+                            CommitRef(
+                                Symbol(
+                                    "0",
+                                ),
                             ),
                         ),
                     ),
@@ -3158,11 +4271,15 @@ mod tests {
                     Union(
                         Filter(
                             Author(
-                                "B",
+                                Substring(
+                                    "B",
+                                ),
                             ),
                         ),
-                        Symbol(
-                            "1",
+                        CommitRef(
+                            Symbol(
+                                "1",
+                            ),
                         ),
                     ),
                 ),
@@ -3171,11 +4288,15 @@ mod tests {
                 Union(
                     Filter(
                         Author(
-                            "C",
+                            Substring(
+                                "C",
+                            ),
                         ),
                     ),
-                    Symbol(
-                        "2",
+                    CommitRef(
+                        Symbol(
+                            "2",
+                        ),
                     ),
                 ),
             ),
@@ -3188,68 +4309,104 @@ mod tests {
         // Typical scenario: fold nested parents()
         insta::assert_debug_snapshot!(optimize(parse("foo--").unwrap()), @r###"
         Ancestors {
-            heads: Symbol(
-                "foo",
+            heads: CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
             generation: 2..3,
         }
         "###);
-        insta::assert_debug_snapshot!(optimize(parse(":(foo---)").unwrap()), @r###"
+        insta::assert_debug_snapshot!(optimize(parse("::(foo---)").unwrap()), @r###"
         Ancestors {
-            heads: Symbol(
-                "foo",
+            heads: CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
-            generation: 3..4294967295,
+            generation: 3..18446744073709551615,
         }
         "###);
-        insta::assert_debug_snapshot!(optimize(parse("(:foo)---").unwrap()), @r###"
+        insta::assert_debug_snapshot!(optimize(parse("(::foo)---").unwrap()), @r###"
         Ancestors {
-            heads: Symbol(
-                "foo",
+            heads: CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
-            generation: 3..4294967295,
+            generation: 3..18446744073709551615,
         }
         "###);
 
         // 'foo-+' is not 'foo'.
         insta::assert_debug_snapshot!(optimize(parse("foo---+").unwrap()), @r###"
-        Children(
-            Ancestors {
-                heads: Symbol(
-                    "foo",
+        Descendants {
+            roots: Ancestors {
+                heads: CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
                 ),
                 generation: 3..4,
             },
-        )
+            generation: 1..2,
+        }
         "###);
 
         // For 'roots..heads', heads can be folded.
         insta::assert_debug_snapshot!(optimize(parse("foo..(bar--)").unwrap()), @r###"
         Range {
-            roots: Symbol(
-                "foo",
-            ),
-            heads: Symbol(
-                "bar",
-            ),
-            generation: 2..4294967295,
-        }
-        "###);
-        // roots can also be folded, but range expression cannot be reconstructed.
-        // No idea if this is better than the original range expression.
-        insta::assert_debug_snapshot!(optimize(parse("(foo--)..(bar---)").unwrap()), @r###"
-        Difference(
-            Ancestors {
-                heads: Symbol(
-                    "bar",
-                ),
-                generation: 3..4294967295,
-            },
-            Ancestors {
-                heads: Symbol(
+            roots: CommitRef(
+                Symbol(
                     "foo",
                 ),
-                generation: 2..4294967295,
+            ),
+            heads: CommitRef(
+                Symbol(
+                    "bar",
+                ),
+            ),
+            generation: 2..18446744073709551615,
+        }
+        "###);
+        // roots can also be folded, and the range expression is reconstructed.
+        insta::assert_debug_snapshot!(optimize(parse("(foo--)..(bar---)").unwrap()), @r###"
+        Range {
+            roots: Ancestors {
+                heads: CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
+                ),
+                generation: 2..3,
+            },
+            heads: CommitRef(
+                Symbol(
+                    "bar",
+                ),
+            ),
+            generation: 3..18446744073709551615,
+        }
+        "###);
+        // Bounded ancestors shouldn't be substituted to range.
+        insta::assert_debug_snapshot!(
+            optimize(parse("~ancestors(foo, 2) & ::bar").unwrap()), @r###"
+        Difference(
+            Ancestors {
+                heads: CommitRef(
+                    Symbol(
+                        "bar",
+                    ),
+                ),
+                generation: 0..18446744073709551615,
+            },
+            Ancestors {
+                heads: CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
+                ),
+                generation: 0..2,
             },
         )
         "###);
@@ -3259,69 +4416,140 @@ mod tests {
         insta::assert_debug_snapshot!(optimize(parse("(foo..bar)--").unwrap()), @r###"
         Ancestors {
             heads: Range {
-                roots: Symbol(
-                    "foo",
+                roots: CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
                 ),
-                heads: Symbol(
-                    "bar",
+                heads: CommitRef(
+                    Symbol(
+                        "bar",
+                    ),
                 ),
-                generation: 0..4294967295,
+                generation: 0..18446744073709551615,
             },
             generation: 2..3,
         }
         "###);
         insta::assert_debug_snapshot!(optimize(parse("foo..(bar..baz)").unwrap()), @r###"
         Range {
-            roots: Symbol(
-                "foo",
+            roots: CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
             heads: Range {
-                roots: Symbol(
-                    "bar",
+                roots: CommitRef(
+                    Symbol(
+                        "bar",
+                    ),
                 ),
-                heads: Symbol(
-                    "baz",
+                heads: CommitRef(
+                    Symbol(
+                        "baz",
+                    ),
                 ),
-                generation: 0..4294967295,
+                generation: 0..18446744073709551615,
             },
-            generation: 0..4294967295,
+            generation: 0..18446744073709551615,
         }
         "###);
 
         // Ancestors of empty generation range should be empty.
-        // TODO: rewrite these tests if we added syntax for arbitrary generation
-        // ancestors
-        let empty_generation_ancestors = |heads| {
-            Rc::new(RevsetExpression::Ancestors {
-                heads,
-                generation: GENERATION_RANGE_EMPTY,
-            })
-        };
         insta::assert_debug_snapshot!(
-            optimize(empty_generation_ancestors(
-                RevsetExpression::symbol("foo".to_owned()).ancestors()
-            )),
-            @r###"
+            optimize(parse("ancestors(ancestors(foo), 0)").unwrap()), @r###"
         Ancestors {
-            heads: Symbol(
-                "foo",
+            heads: CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
             generation: 0..0,
         }
         "###
         );
         insta::assert_debug_snapshot!(
-            optimize(
-                empty_generation_ancestors(RevsetExpression::symbol("foo".to_owned())).ancestors()
-            ),
-            @r###"
+            optimize(parse("ancestors(ancestors(foo, 0))").unwrap()), @r###"
         Ancestors {
-            heads: Symbol(
-                "foo",
+            heads: CommitRef(
+                Symbol(
+                    "foo",
+                ),
             ),
             generation: 0..0,
         }
         "###
         );
+    }
+
+    #[test]
+    fn test_optimize_descendants() {
+        // Typical scenario: fold nested children()
+        insta::assert_debug_snapshot!(optimize(parse("foo++").unwrap()), @r###"
+        Descendants {
+            roots: CommitRef(
+                Symbol(
+                    "foo",
+                ),
+            ),
+            generation: 2..3,
+        }
+        "###);
+        insta::assert_debug_snapshot!(optimize(parse("(foo+++)::").unwrap()), @r###"
+        Descendants {
+            roots: CommitRef(
+                Symbol(
+                    "foo",
+                ),
+            ),
+            generation: 3..18446744073709551615,
+        }
+        "###);
+        insta::assert_debug_snapshot!(optimize(parse("(foo::)+++").unwrap()), @r###"
+        Descendants {
+            roots: CommitRef(
+                Symbol(
+                    "foo",
+                ),
+            ),
+            generation: 3..18446744073709551615,
+        }
+        "###);
+
+        // 'foo+-' is not 'foo'.
+        insta::assert_debug_snapshot!(optimize(parse("foo+++-").unwrap()), @r###"
+        Ancestors {
+            heads: Descendants {
+                roots: CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
+                ),
+                generation: 3..4,
+            },
+            generation: 1..2,
+        }
+        "###);
+
+        // TODO: Inner Descendants can be folded into DagRange. Perhaps, we can rewrite
+        // 'x::y' to 'x:: & ::y' first, so the common substitution rule can handle both
+        // 'x+::y' and 'x+ & ::y'.
+        insta::assert_debug_snapshot!(optimize(parse("(foo++)::bar").unwrap()), @r###"
+        DagRange {
+            roots: Descendants {
+                roots: CommitRef(
+                    Symbol(
+                        "foo",
+                    ),
+                ),
+                generation: 2..3,
+            },
+            heads: CommitRef(
+                Symbol(
+                    "bar",
+                ),
+            ),
+        }
+        "###);
     }
 }

@@ -12,16 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(missing_docs)]
+
 use std::cmp::Ordering;
 use std::fmt::{Debug, Error, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use crate::backend;
-use crate::backend::{ChangeId, CommitId, Signature, TreeId};
-use crate::repo_path::RepoPath;
+use itertools::Itertools;
+
+use crate::backend::{self, BackendResult, ChangeId, CommitId, MergedTreeId, Signature};
+use crate::merged_tree::MergedTree;
+use crate::repo::Repo;
+use crate::rewrite::merge_commit_trees;
+use crate::signing::{SignResult, Verification};
 use crate::store::Store;
-use crate::tree::Tree;
 
 #[derive(Clone)]
 pub struct Commit {
@@ -52,7 +57,7 @@ impl Ord for Commit {
 
 impl PartialOrd for Commit {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.id.cmp(&other.id))
+        Some(self.cmp(other))
     }
 }
 
@@ -79,34 +84,53 @@ impl Commit {
         &self.data.parents
     }
 
-    pub fn parents(&self) -> Vec<Commit> {
-        self.data
-            .parents
-            .iter()
-            .map(|id| self.store.get_commit(id).unwrap())
-            .collect()
+    pub fn parents(&self) -> impl Iterator<Item = BackendResult<Commit>> + '_ {
+        self.data.parents.iter().map(|id| self.store.get_commit(id))
     }
 
     pub fn predecessor_ids(&self) -> &[CommitId] {
         &self.data.predecessors
     }
 
-    pub fn predecessors(&self) -> Vec<Commit> {
+    pub fn predecessors(&self) -> impl Iterator<Item = BackendResult<Commit>> + '_ {
         self.data
             .predecessors
             .iter()
-            .map(|id| self.store.get_commit(id).unwrap())
-            .collect()
+            .map(|id| self.store.get_commit(id))
     }
 
-    pub fn tree(&self) -> Tree {
-        self.store
-            .get_tree(&RepoPath::root(), &self.data.root_tree)
-            .unwrap()
+    pub fn tree(&self) -> BackendResult<MergedTree> {
+        self.store.get_root_tree(&self.data.root_tree)
     }
 
-    pub fn tree_id(&self) -> &TreeId {
+    pub fn tree_id(&self) -> &MergedTreeId {
         &self.data.root_tree
+    }
+
+    /// Return the parent tree, merging the parent trees if there are multiple
+    /// parents.
+    pub fn parent_tree(&self, repo: &dyn Repo) -> BackendResult<MergedTree> {
+        let parents: Vec<_> = self.parents().try_collect()?;
+        merge_commit_trees(repo, &parents)
+    }
+
+    /// Returns whether commit's content is empty. Commit description is not
+    /// taken into consideration.
+    pub fn is_empty(&self, repo: &dyn Repo) -> BackendResult<bool> {
+        let parents: Vec<_> = self.parents().try_collect()?;
+        if let [parent] = &parents[..] {
+            return Ok(parent.tree_id() == self.tree_id());
+        }
+        let parent_tree = merge_commit_trees(repo, &parents)?;
+        Ok(*self.tree_id() == parent_tree.id())
+    }
+
+    pub fn has_conflict(&self) -> BackendResult<bool> {
+        if let MergedTreeId::Merge(tree_ids) = self.tree_id() {
+            Ok(!tree_ids.is_resolved())
+        } else {
+            Ok(self.tree()?.has_conflict())
+        }
     }
 
     pub fn change_id(&self) -> &ChangeId {
@@ -131,12 +155,60 @@ impl Commit {
 
     /// A commit is discardable if it has one parent, no change from its
     /// parent, and an empty description.
-    pub fn is_discardable(&self) -> bool {
+    pub fn is_discardable(&self) -> BackendResult<bool> {
         if self.description().is_empty() {
-            if let [parent_commit] = &*self.parents() {
-                return self.tree_id() == parent_commit.tree_id();
+            let parents: Vec<_> = self.parents().try_collect()?;
+            if let [parent_commit] = &*parents {
+                return Ok(self.tree_id() == parent_commit.tree_id());
             }
         }
-        false
+        Ok(false)
+    }
+
+    /// A quick way to just check if a signature is present.
+    pub fn is_signed(&self) -> bool {
+        self.data.secure_sig.is_some()
+    }
+
+    /// A slow (but cached) way to get the full verification.
+    pub fn verification(&self) -> SignResult<Option<Verification>> {
+        self.data
+            .secure_sig
+            .as_ref()
+            .map(|sig| self.store.signer().verify(&self.id, &sig.data, &sig.sig))
+            .transpose()
+    }
+}
+
+pub trait CommitIteratorExt<'c, I> {
+    fn ids(self) -> impl Iterator<Item = &'c CommitId>;
+}
+
+impl<'c, I> CommitIteratorExt<'c, I> for I
+where
+    I: Iterator<Item = &'c Commit>,
+{
+    fn ids(self) -> impl Iterator<Item = &'c CommitId> {
+        self.map(|commit| commit.id())
+    }
+}
+
+/// Wrapper to sort `Commit` by committer timestamp.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CommitByCommitterTimestamp(pub Commit);
+
+impl Ord for CommitByCommitterTimestamp {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let self_timestamp = &self.0.committer().timestamp.timestamp;
+        let other_timestamp = &other.0.committer().timestamp.timestamp;
+        self_timestamp
+            .cmp(other_timestamp)
+            .then_with(|| self.0.cmp(&other.0)) // to comply with Eq
+    }
+}
+
+impl PartialOrd for CommitByCommitterTimestamp {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }

@@ -20,7 +20,7 @@ enum FileType {
   Normal = 0;
   Symlink = 1;
   Executable = 2;
-  Conflict = 3;
+  Conflict = 3 [deprecated = true];
   GitSubmodule = 4;
 }
 
@@ -29,7 +29,12 @@ message FileState {
   uint64 size = 2;
   FileType file_type = 3;
   // Set only if file_type is Conflict
-  bytes conflict_id = 4;
+  bytes conflict_id = 4 [deprecated = true];
+}
+
+message FileStateEntry {
+  string path = 1;
+  FileState state = 2;
 }
 
 message SparsePatterns {
@@ -37,9 +42,20 @@ message SparsePatterns {
 }
 
 message TreeState {
-  bytes tree_id = 1;
-  map<string, FileState> file_states = 2;
+  bytes legacy_tree_id = 1;
+  // Alternating positive and negative terms if there's a conflict, otherwise a
+  // single (positive) value
+  repeated bytes tree_ids = 5;
+  repeated FileStateEntry file_states = 2;
   SparsePatterns sparse_patterns = 3;
+  WatchmanClock watchman_clock = 4;
+}
+
+message WatchmanClock {
+  oneof watchman_clock {
+    string string_clock = 1;
+    int64 unix_timestamp = 2;
+  }
 }
 
 message Checkout {
@@ -50,8 +66,5 @@ message Checkout {
   // TODO: Is it better to make this a UUID and a have map that to a name in
   // config? That way users can rename a workspace.
   string workspace_id = 3;
-  // The checked-out commit, which can be viewed as a cache of the working-copy
-  // commit ID recorded in `operation_id`'s operation. No longer used.
-  // TODO: Delete this mid 2022 or so
-  bytes commit_id = 1;
+  reserved 1;
 }

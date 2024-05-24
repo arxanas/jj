@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(missing_docs)]
+
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -19,7 +21,10 @@ use chrono::DateTime;
 use rand::prelude::*;
 use rand_chacha::ChaCha20Rng;
 
-use crate::backend::{ChangeId, ObjectId, Signature, Timestamp};
+use crate::backend::{ChangeId, Commit, Signature, Timestamp};
+use crate::fmt_util::binary_prefix;
+use crate::fsmonitor::FsmonitorKind;
+use crate::signing::SignBehavior;
 
 #[derive(Debug, Clone)]
 pub struct UserSettings {
@@ -36,12 +41,16 @@ pub struct RepoSettings {
 #[derive(Debug, Clone)]
 pub struct GitSettings {
     pub auto_local_branch: bool,
+    pub abandon_unreachable_commits: bool,
 }
 
 impl GitSettings {
     pub fn from_config(config: &config::Config) -> Self {
         GitSettings {
-            auto_local_branch: config.get_bool("git.auto-local-branch").unwrap_or(true),
+            auto_local_branch: config.get_bool("git.auto-local-branch").unwrap_or(false),
+            abandon_unreachable_commits: config
+                .get_bool("git.abandon-unreachable-commits")
+                .unwrap_or(true),
         }
     }
 }
@@ -49,7 +58,52 @@ impl GitSettings {
 impl Default for GitSettings {
     fn default() -> Self {
         GitSettings {
-            auto_local_branch: true,
+            auto_local_branch: false,
+            abandon_unreachable_commits: true,
+        }
+    }
+}
+
+/// Commit signing settings, describes how to and if to sign commits.
+#[derive(Debug, Clone, Default)]
+pub struct SignSettings {
+    /// What to actually do, see [SignBehavior].
+    pub behavior: SignBehavior,
+    /// The email address to compare against the commit author when determining
+    /// if the existing signature is "our own" in terms of the sign behavior.
+    pub user_email: String,
+    /// The signing backend specific key, to be passed to the signing backend.
+    pub key: Option<String>,
+}
+
+impl SignSettings {
+    /// Load the signing settings from the config.
+    pub fn from_settings(settings: &UserSettings) -> Self {
+        let sign_all = settings
+            .config()
+            .get_bool("signing.sign-all")
+            .unwrap_or(false);
+        Self {
+            behavior: if sign_all {
+                SignBehavior::Own
+            } else {
+                SignBehavior::Keep
+            },
+            user_email: settings.user_email(),
+            key: settings.config().get_string("signing.key").ok(),
+        }
+    }
+
+    /// Check if a commit should be signed according to the configured behavior
+    /// and email.
+    pub fn should_sign(&self, commit: &Commit) -> bool {
+        match self.behavior {
+            SignBehavior::Drop => false,
+            SignBehavior::Keep => {
+                commit.secure_sig.is_some() && commit.author.email == self.user_email
+            }
+            SignBehavior::Own => commit.author.email == self.user_email,
+            SignBehavior::Force => true,
         }
     }
 }
@@ -93,25 +147,34 @@ impl UserSettings {
         self.rng.clone()
     }
 
-    pub fn user_name(&self) -> String {
+    pub fn use_tree_conflict_format(&self) -> bool {
         self.config
-            .get_string("user.name")
-            .unwrap_or_else(|_| Self::user_name_placeholder().to_string())
+            .get_bool("format.tree-level-conflicts")
+            .unwrap_or(false)
     }
 
-    pub fn user_name_placeholder() -> &'static str {
-        "(no name configured)"
+    pub fn user_name(&self) -> String {
+        self.config.get_string("user.name").unwrap_or_default()
     }
+
+    // Must not be changed to avoid git pushing older commits with no set name
+    pub const USER_NAME_PLACEHOLDER: &'static str = "(no name configured)";
 
     pub fn user_email(&self) -> String {
-        self.config
-            .get_string("user.email")
-            .unwrap_or_else(|_| Self::user_email_placeholder().to_string())
+        self.config.get_string("user.email").unwrap_or_default()
     }
 
-    pub fn user_email_placeholder() -> &'static str {
-        "(no email configured)"
+    pub fn fsmonitor_kind(&self) -> Result<FsmonitorKind, config::ConfigError> {
+        match self.config.get_string("core.fsmonitor") {
+            Ok(fsmonitor_kind) => Ok(fsmonitor_kind.parse()?),
+            Err(config::ConfigError::NotFound(_)) => Ok(FsmonitorKind::None),
+            Err(err) => Err(err),
+        }
     }
+
+    // Must not be changed to avoid git pushing older commits with no set email
+    // address
+    pub const USER_EMAIL_PLACEHOLDER: &'static str = "(no email configured)";
 
     pub fn operation_timestamp(&self) -> Option<Timestamp> {
         get_timestamp_config(&self.config, "debug.operation-timestamp")
@@ -120,7 +183,7 @@ impl UserSettings {
     pub fn operation_hostname(&self) -> String {
         self.config
             .get_string("operation.hostname")
-            .unwrap_or_else(|_| whoami::hostname())
+            .unwrap_or_else(|_| whoami::fallible::hostname().expect("valid hostname"))
     }
 
     pub fn operation_username(&self) -> String {
@@ -131,16 +194,18 @@ impl UserSettings {
 
     pub fn push_branch_prefix(&self) -> String {
         self.config
-            .get_string("push.branch-prefix")
+            .get_string("git.push-branch-prefix")
             .unwrap_or_else(|_| "push-".to_string())
     }
 
+    pub fn default_description(&self) -> String {
+        self.config()
+            .get_string("ui.default-description")
+            .unwrap_or_default()
+    }
+
     pub fn default_revset(&self) -> String {
-        self.config
-            .get_string("ui.default-revset")
-            .unwrap_or_else(|_| {
-                "@ | (remote_branches() | tags()).. | ((remote_branches() | tags())..)-".to_string()
-            })
+        self.config.get_string("revsets.log").unwrap_or_default()
     }
 
     pub fn signature(&self) -> Signature {
@@ -171,6 +236,53 @@ impl UserSettings {
             .get_string("ui.graph.style")
             .unwrap_or_else(|_| "curved".to_string())
     }
+
+    pub fn commit_node_template(&self) -> String {
+        self.node_template_for_key(
+            "templates.log_node",
+            r#"if(self, if(current_working_copy, "@", "◉"), "◌")"#,
+            r#"if(self, if(current_working_copy, "@", "o"), ".")"#,
+        )
+    }
+
+    pub fn op_node_template(&self) -> String {
+        self.node_template_for_key(
+            "templates.op_log_node",
+            r#"if(current_operation, "@", "◉")"#,
+            r#"if(current_operation, "@", "o")"#,
+        )
+    }
+
+    pub fn max_new_file_size(&self) -> Result<u64, config::ConfigError> {
+        let cfg = self
+            .config
+            .get::<HumanByteSize>("snapshot.max-new-file-size")
+            .map(|x| x.0);
+        match cfg {
+            Ok(0) => Ok(u64::MAX),
+            x @ Ok(_) => x,
+            Err(config::ConfigError::NotFound(_)) => Ok(1024 * 1024),
+            e @ Err(_) => e,
+        }
+    }
+
+    // separate from sign_settings as those two are needed in pretty different
+    // places
+    pub fn signing_backend(&self) -> Option<String> {
+        self.config.get_string("signing.backend").ok()
+    }
+
+    pub fn sign_settings(&self) -> SignSettings {
+        SignSettings::from_settings(self)
+    }
+
+    fn node_template_for_key(&self, key: &str, fallback: &str, ascii_fallback: &str) -> String {
+        let symbol = self.config.get_string(key);
+        match self.graph_style().as_str() {
+            "ascii" | "ascii-large" => symbol.unwrap_or_else(|_| ascii_fallback.to_owned()),
+            _ => symbol.unwrap_or_else(|_| fallback.to_owned()),
+        }
+    }
 }
 
 /// This Rng uses interior mutability to allow generating random values using an
@@ -196,5 +308,99 @@ impl JJRng {
             Some(seed) => ChaCha20Rng::seed_from_u64(seed),
             None => ChaCha20Rng::from_entropy(),
         }
+    }
+}
+
+pub trait ConfigResultExt<T> {
+    fn optional(self) -> Result<Option<T>, config::ConfigError>;
+}
+
+impl<T> ConfigResultExt<T> for Result<T, config::ConfigError> {
+    fn optional(self) -> Result<Option<T>, config::ConfigError> {
+        match self {
+            Ok(value) => Ok(Some(value)),
+            Err(config::ConfigError::NotFound(_)) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+/// A size in bytes optionally formatted/serialized with binary prefixes
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, serde::Deserialize)]
+#[serde(try_from = "String")]
+pub struct HumanByteSize(pub u64);
+
+impl std::fmt::Display for HumanByteSize {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (value, prefix) = binary_prefix(self.0 as f32);
+        write!(f, "{value:.1}{prefix}B")
+    }
+}
+
+impl TryFrom<String> for HumanByteSize {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let res = value.parse::<u64>();
+        match res {
+            Ok(bytes) => Ok(HumanByteSize(bytes)),
+            Err(_) => {
+                let bytes = parse_human_byte_size(&value)?;
+                Ok(HumanByteSize(bytes))
+            }
+        }
+    }
+}
+
+fn parse_human_byte_size(v: &str) -> Result<u64, &str> {
+    let digit_end = v.find(|c: char| !c.is_ascii_digit()).unwrap_or(v.len());
+    if digit_end == 0 {
+        return Err("must start with a number");
+    }
+    let (digits, trailing) = v.split_at(digit_end);
+    let exponent = match trailing.trim_start() {
+        "" | "B" => 0,
+        unit => {
+            const PREFIXES: [char; 8] = ['K', 'M', 'G', 'T', 'P', 'E', 'Z', 'Y'];
+            let Some(prefix) = PREFIXES.iter().position(|&x| unit.starts_with(x)) else {
+                return Err("unrecognized unit prefix");
+            };
+            let ("" | "B" | "i" | "iB") = &unit[1..] else {
+                return Err("unrecognized unit");
+            };
+            prefix as u32 + 1
+        }
+    };
+    // A string consisting only of base 10 digits is either a valid u64 or really
+    // huge.
+    let factor = digits.parse::<u64>().unwrap_or(u64::MAX);
+    Ok(factor.saturating_mul(1024u64.saturating_pow(exponent)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_size_parse() {
+        assert_eq!(parse_human_byte_size("0"), Ok(0));
+        assert_eq!(parse_human_byte_size("42"), Ok(42));
+        assert_eq!(parse_human_byte_size("42B"), Ok(42));
+        assert_eq!(parse_human_byte_size("42 B"), Ok(42));
+        assert_eq!(parse_human_byte_size("42K"), Ok(42 * 1024));
+        assert_eq!(parse_human_byte_size("42 K"), Ok(42 * 1024));
+        assert_eq!(parse_human_byte_size("42 KB"), Ok(42 * 1024));
+        assert_eq!(parse_human_byte_size("42 KiB"), Ok(42 * 1024));
+        assert_eq!(
+            parse_human_byte_size("42 LiB"),
+            Err("unrecognized unit prefix")
+        );
+        assert_eq!(parse_human_byte_size("42 KiC"), Err("unrecognized unit"));
+        assert_eq!(parse_human_byte_size("42 KC"), Err("unrecognized unit"));
+        assert_eq!(
+            parse_human_byte_size("KiB"),
+            Err("must start with a number")
+        );
+        assert_eq!(parse_human_byte_size(""), Err("must start with a number"));
     }
 }

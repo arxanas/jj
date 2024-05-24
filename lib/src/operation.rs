@@ -12,21 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(missing_docs)]
+
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::fmt::{Debug, Error, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use crate::backend::CommitId;
 use crate::op_store;
-use crate::op_store::{OpStore, OperationId, ViewId};
+use crate::op_store::{OpStore, OpStoreResult, OperationId, OperationMetadata, ViewId};
+use crate::view::View;
 
+/// A wrapper around [`op_store::Operation`] that defines additional methods and
+/// stores a pointer to the `OpStore` the operation belongs to.
 #[derive(Clone)]
 pub struct Operation {
     op_store: Arc<dyn OpStore>,
     id: OperationId,
-    data: op_store::Operation,
+    data: Arc<op_store::Operation>, // allow cheap clone
 }
 
 impl Debug for Operation {
@@ -51,7 +54,7 @@ impl Ord for Operation {
 
 impl PartialOrd for Operation {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.id.cmp(&other.id))
+        Some(self.cmp(other))
     }
 }
 
@@ -62,8 +65,16 @@ impl Hash for Operation {
 }
 
 impl Operation {
-    pub fn new(op_store: Arc<dyn OpStore>, id: OperationId, data: op_store::Operation) -> Self {
-        Operation { op_store, id, data }
+    pub fn new(
+        op_store: Arc<dyn OpStore>,
+        id: OperationId,
+        data: impl Into<Arc<op_store::Operation>>,
+    ) -> Self {
+        Operation {
+            op_store,
+            id,
+            data: data.into(),
+        }
     }
 
     pub fn op_store(&self) -> Arc<dyn OpStore> {
@@ -74,94 +85,32 @@ impl Operation {
         &self.id
     }
 
-    pub fn parent_ids(&self) -> &Vec<OperationId> {
+    pub fn view_id(&self) -> &ViewId {
+        &self.data.view_id
+    }
+
+    pub fn parent_ids(&self) -> &[OperationId] {
         &self.data.parents
     }
 
-    pub fn parents(&self) -> Vec<Operation> {
-        let mut parents = Vec::new();
-        for parent_id in &self.data.parents {
-            let data = self.op_store.read_operation(parent_id).unwrap();
-            parents.push(Operation::new(
-                self.op_store.clone(),
-                parent_id.clone(),
-                data,
-            ));
-        }
-        parents
+    pub fn parents(&self) -> impl ExactSizeIterator<Item = OpStoreResult<Operation>> + '_ {
+        let op_store = &self.op_store;
+        self.data.parents.iter().map(|parent_id| {
+            let data = op_store.read_operation(parent_id)?;
+            Ok(Operation::new(op_store.clone(), parent_id.clone(), data))
+        })
     }
 
-    pub fn view(&self) -> View {
-        let data = self.op_store.read_view(&self.data.view_id).unwrap();
-        View::new(self.op_store.clone(), self.data.view_id.clone(), data)
+    pub fn view(&self) -> OpStoreResult<View> {
+        let data = self.op_store.read_view(&self.data.view_id)?;
+        Ok(View::new(data))
+    }
+
+    pub fn metadata(&self) -> &OperationMetadata {
+        &self.data.metadata
     }
 
     pub fn store_operation(&self) -> &op_store::Operation {
         &self.data
-    }
-}
-
-#[derive(Clone)]
-pub struct View {
-    op_store: Arc<dyn OpStore>,
-    id: ViewId,
-    data: op_store::View,
-}
-
-impl Debug for View {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), Error> {
-        f.debug_struct("View").field("id", &self.id).finish()
-    }
-}
-
-impl PartialEq for View {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
-    }
-}
-
-impl Eq for View {}
-
-impl Ord for View {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.id.cmp(&other.id)
-    }
-}
-
-impl PartialOrd for View {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.id.cmp(&other.id))
-    }
-}
-
-impl Hash for View {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state)
-    }
-}
-
-impl View {
-    pub fn new(op_store: Arc<dyn OpStore>, id: ViewId, data: op_store::View) -> Self {
-        View { op_store, id, data }
-    }
-
-    pub fn op_store(&self) -> Arc<dyn OpStore> {
-        self.op_store.clone()
-    }
-
-    pub fn id(&self) -> &ViewId {
-        &self.id
-    }
-
-    pub fn store_view(&self) -> &op_store::View {
-        &self.data
-    }
-
-    pub fn take_store_view(self) -> op_store::View {
-        self.data
-    }
-
-    pub fn heads(&self) -> &HashSet<CommitId> {
-        &self.data.head_ids
     }
 }

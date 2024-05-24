@@ -1,6 +1,5 @@
 # Operation log
 
-
 ## Introduction
 
 Jujutsu records each operation that modifies the repo in the "operation log".
@@ -17,9 +16,13 @@ The operation log allows you to undo an operation (`jj [op] undo`), which doesn'
 need to be the most recent one. It also lets you restore the entire repo to the
 way it looked at an earlier point (`jj op restore`).
 
-When referring to operations, you can use `@` to represent the current operation
-as well as the `-` operator (e.g. `@-`) to get the parent of an operation.
+When referring to operations, you can use `@` to represent the current
+operation.
 
+The following operators are supported:
+
+- `x-`: Parents of `x` (e.g. `@-`)
+- `x+`: Children of `x`
 
 ## Concurrent operations
 
@@ -38,10 +41,9 @@ then also update the contents of the change (maybe because you had forgotten the
 editor). When you eventually close your editor, the command will succeed and
 e.g. `jj log` will indicate that the change has diverged.
 
-
 ## Loading an old version of the repo
 
-The top-level `--at-operation/--at-top` option allows you to load the repo at a
+The top-level `--at-operation/--at-op` option allows you to load the repo at a
 specific operation. This can be useful for understanding how your repo got into
 the current state. It can be even more useful for understanding why someone
 else's repo got into its current state.

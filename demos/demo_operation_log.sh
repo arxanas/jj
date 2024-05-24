@@ -1,10 +1,14 @@
 #!/bin/bash
 set -euo pipefail
-. "$(dirname "$0")"/demo_helpers.sh
+. "$(dirname "$0")"/helpers.sh
 
 new_tmp_dir
-jj git clone https://github.com/octocat/Hello-World
-cd Hello-World
+{
+  jj git clone https://github.com/octocat/Hello-World
+  cd Hello-World
+  jj abandon octocat-patch-1
+  jj branch forget octocat-patch-1
+} > /dev/null
 
 comment "We are in the octocat/Hello-World repo.
 The \"operation log\" shows the operations
@@ -27,10 +31,10 @@ comment "The repo now looks like this:"
 run_command "jj log"
 comment "The most recent portion of the operation log
 is:"
-run_command "jj op log --color=always | head"
+run_command_allow_broken_pipe "jj op log --limit 4"
 
 comment "Let's undo that rebase operation:"
-rebase_op=$(jj --color=never op log | grep '^●  ' | sed '2q;d' | cut -b4-15)
+rebase_op=$(jj --color=never op log --no-graph -T 'id.short(5)' --limit 1 --at-op @--)
 run_command "jj undo $rebase_op"
 
 comment "Note that only the rebase was undone, and the

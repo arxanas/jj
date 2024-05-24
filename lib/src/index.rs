@@ -12,213 +12,169 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Interfaces for indexes of the commits in a repository.
+
 use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::backend::{CommitId, ObjectId};
+use crate::backend::{ChangeId, CommitId};
 use crate::commit::Commit;
-use crate::default_index_store::{IndexEntry, RevWalk};
-use crate::op_store::OperationId;
+use crate::object_id::{HexPrefix, PrefixResolution};
 use crate::operation::Operation;
-use crate::repo::Repo;
-use crate::revset::{Revset, RevsetError, RevsetExpression};
+use crate::revset::{ResolvedExpression, Revset, RevsetEvaluationError};
 use crate::store::Store;
 
+/// Returned if an error occurs while reading an index from the [`IndexStore`].
 #[derive(Debug, Error)]
-pub enum IndexWriteError {
-    #[error("{0}")]
-    Other(String),
-}
+#[error(transparent)]
+pub struct IndexReadError(pub Box<dyn std::error::Error + Send + Sync>);
 
+/// Returned if an error occurs while writing an index to the [`IndexStore`].
+#[derive(Debug, Error)]
+#[error(transparent)]
+pub struct IndexWriteError(pub Box<dyn std::error::Error + Send + Sync>);
+
+/// An error returned if `Index::all_heads_for_gc()` is not supported by the
+/// index backend.
+#[derive(Debug, Error)]
+#[error("Cannot collect all heads by index of this type")]
+pub struct AllHeadsForGcUnsupported;
+
+/// Defines the interface for types that provide persistent storage for an
+/// index.
 pub trait IndexStore: Send + Sync + Debug {
+    #[allow(missing_docs)]
     fn as_any(&self) -> &dyn Any;
 
+    /// Returns a name representing the type of index that the `IndexStore` is
+    /// compatible with. For example, the `IndexStore` for the default index
+    /// returns "default".
     fn name(&self) -> &str;
 
-    fn get_index_at_op(&self, op: &Operation, store: &Arc<Store>) -> Box<dyn ReadonlyIndex>;
+    /// Returns the index at the specified operation.
+    fn get_index_at_op(
+        &self,
+        op: &Operation,
+        store: &Arc<Store>,
+    ) -> Result<Box<dyn ReadonlyIndex>, IndexReadError>;
 
+    /// Writes `index` to the index store and returns a read-only version of the
+    /// index.
     fn write_index(
         &self,
         index: Box<dyn MutableIndex>,
-        op_id: &OperationId,
+        op: &Operation,
     ) -> Result<Box<dyn ReadonlyIndex>, IndexWriteError>;
 }
 
+/// Defines the interface for types that provide an index of the commits in a
+/// repository by [`CommitId`].
 pub trait Index: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
-
+    /// Returns the minimum prefix length to disambiguate `commit_id` from other
+    /// commits in the index. The length returned is the number of hexadecimal
+    /// digits in the minimum prefix.
+    ///
+    /// If the given `commit_id` doesn't exist, returns the minimum prefix
+    /// length which matches none of the commits in the index.
     fn shortest_unique_commit_id_prefix_len(&self, commit_id: &CommitId) -> usize;
 
-    fn resolve_prefix(&self, prefix: &HexPrefix) -> PrefixResolution<CommitId>;
+    /// Searches the index for commit IDs matching `prefix`. Returns a
+    /// [`PrefixResolution`] with a [`CommitId`] if the prefix matches a single
+    /// commit.
+    fn resolve_commit_id_prefix(&self, prefix: &HexPrefix) -> PrefixResolution<CommitId>;
 
-    fn entry_by_id(&self, commit_id: &CommitId) -> Option<IndexEntry>;
-
+    /// Returns true if `commit_id` is present in the index.
     fn has_id(&self, commit_id: &CommitId) -> bool;
 
+    /// Returns true if `ancestor_id` commit is an ancestor of the
+    /// `descendant_id` commit, or if `ancestor_id` equals `descendant_id`.
     fn is_ancestor(&self, ancestor_id: &CommitId, descendant_id: &CommitId) -> bool;
 
+    /// Returns the best common ancestor or ancestors of the commits in `set1`
+    /// and `set2`. A "best common ancestor" has no descendants that are also
+    /// common ancestors.
     fn common_ancestors(&self, set1: &[CommitId], set2: &[CommitId]) -> Vec<CommitId>;
 
-    fn walk_revs(&self, wanted: &[CommitId], unwanted: &[CommitId]) -> RevWalk;
+    /// Heads among all indexed commits at the associated operation.
+    ///
+    /// Suppose the index contains all the historical heads and their
+    /// ancestors/predecessors reachable from the associated operation, this
+    /// function returns the heads that should be preserved on garbage
+    /// collection.
+    ///
+    /// The iteration order is unspecified.
+    fn all_heads_for_gc(
+        &self,
+    ) -> Result<Box<dyn Iterator<Item = CommitId> + '_>, AllHeadsForGcUnsupported>;
 
+    /// Returns the subset of commit IDs in `candidates` which are not ancestors
+    /// of other commits in `candidates`. If a commit id is duplicated in the
+    /// `candidates` list it will appear at most once in the output.
     fn heads(&self, candidates: &mut dyn Iterator<Item = &CommitId>) -> Vec<CommitId>;
 
-    /// Parents before children
-    fn topo_order(&self, input: &mut dyn Iterator<Item = &CommitId>) -> Vec<CommitId>;
-
-    // TODO: It's weird that we pass in the repo here since the repo is a
-    // higher-level concept. We should probably pass in the view and store
-    // instead, or maybe we should resolve symbols in the expression before we
-    // get here.
+    /// Resolves the revset `expression` against the index and corresponding
+    /// `store`.
     fn evaluate_revset<'index>(
         &'index self,
-        repo: &'index dyn Repo,
-        expression: &RevsetExpression,
-    ) -> Result<Box<dyn Revset<'index> + 'index>, RevsetError>;
+        expression: &ResolvedExpression,
+        store: &Arc<Store>,
+    ) -> Result<Box<dyn Revset + 'index>, RevsetEvaluationError>;
 }
 
+#[allow(missing_docs)]
 pub trait ReadonlyIndex: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
     fn as_index(&self) -> &dyn Index;
 
+    fn change_id_index(&self, heads: &mut dyn Iterator<Item = &CommitId>)
+        -> Box<dyn ChangeIdIndex>;
+
     fn start_modification(&self) -> Box<dyn MutableIndex>;
 }
 
-pub trait MutableIndex: Any {
+#[allow(missing_docs)]
+pub trait MutableIndex {
+    fn as_any(&self) -> &dyn Any;
+
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
 
     fn as_index(&self) -> &dyn Index;
+
+    fn change_id_index(
+        &self,
+        heads: &mut dyn Iterator<Item = &CommitId>,
+    ) -> Box<dyn ChangeIdIndex + '_>;
 
     fn add_commit(&mut self, commit: &Commit);
 
     fn merge_in(&mut self, other: &dyn ReadonlyIndex);
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HexPrefix {
-    // For odd-length prefix, lower 4 bits of the last byte is padded with 0
-    min_prefix_bytes: Vec<u8>,
-    has_odd_byte: bool,
-}
-
-impl HexPrefix {
-    pub fn new(prefix: &str) -> Option<HexPrefix> {
-        let has_odd_byte = prefix.len() & 1 != 0;
-        let min_prefix_bytes = if has_odd_byte {
-            hex::decode(prefix.to_owned() + "0").ok()?
-        } else {
-            hex::decode(prefix).ok()?
-        };
-        Some(HexPrefix {
-            min_prefix_bytes,
-            has_odd_byte,
-        })
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        HexPrefix {
-            min_prefix_bytes: bytes.to_owned(),
-            has_odd_byte: false,
-        }
-    }
-
-    pub fn hex(&self) -> String {
-        let mut hex_string = hex::encode(&self.min_prefix_bytes);
-        if self.has_odd_byte {
-            hex_string.pop().unwrap();
-        }
-        hex_string
-    }
-
-    /// Minimum bytes that would match this prefix. (e.g. "abc0" for "abc")
+/// Defines the interface for types that provide an index of the commits in a
+/// repository by [`ChangeId`].
+pub trait ChangeIdIndex: Send + Sync {
+    /// Resolve an unambiguous change ID prefix to the commit IDs in the index.
     ///
-    /// Use this to partition a sorted slice, and test `matches(id)` from there.
-    pub fn min_prefix_bytes(&self) -> &[u8] {
-        &self.min_prefix_bytes
-    }
+    /// The order of the returned commit IDs is unspecified.
+    fn resolve_prefix(&self, prefix: &HexPrefix) -> PrefixResolution<Vec<CommitId>>;
 
-    fn split_odd_byte(&self) -> (Option<u8>, &[u8]) {
-        if self.has_odd_byte {
-            let (&odd, prefix) = self.min_prefix_bytes.split_last().unwrap();
-            (Some(odd), prefix)
-        } else {
-            (None, &self.min_prefix_bytes)
-        }
-    }
-
-    pub fn matches<Q: ObjectId>(&self, id: &Q) -> bool {
-        let id_bytes = id.as_bytes();
-        let (maybe_odd, prefix) = self.split_odd_byte();
-        if id_bytes.starts_with(prefix) {
-            if let Some(odd) = maybe_odd {
-                matches!(id_bytes.get(prefix.len()), Some(v) if v & 0xf0 == odd)
-            } else {
-                true
-            }
-        } else {
-            false
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PrefixResolution<T> {
-    NoMatch,
-    SingleMatch(T),
-    AmbiguousMatch,
-}
-
-impl<T: Clone> PrefixResolution<T> {
-    pub fn plus(&self, other: &PrefixResolution<T>) -> PrefixResolution<T> {
-        match (self, other) {
-            (PrefixResolution::NoMatch, other) => other.clone(),
-            (local, PrefixResolution::NoMatch) => local.clone(),
-            (PrefixResolution::AmbiguousMatch, _) => PrefixResolution::AmbiguousMatch,
-            (_, PrefixResolution::AmbiguousMatch) => PrefixResolution::AmbiguousMatch,
-            (PrefixResolution::SingleMatch(_), PrefixResolution::SingleMatch(_)) => {
-                PrefixResolution::AmbiguousMatch
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_hex_prefix_prefixes() {
-        let prefix = HexPrefix::new("").unwrap();
-        assert_eq!(prefix.min_prefix_bytes(), b"");
-
-        let prefix = HexPrefix::new("1").unwrap();
-        assert_eq!(prefix.min_prefix_bytes(), b"\x10");
-
-        let prefix = HexPrefix::new("12").unwrap();
-        assert_eq!(prefix.min_prefix_bytes(), b"\x12");
-
-        let prefix = HexPrefix::new("123").unwrap();
-        assert_eq!(prefix.min_prefix_bytes(), b"\x12\x30");
-    }
-
-    #[test]
-    fn test_hex_prefix_matches() {
-        let id = CommitId::from_hex("1234");
-
-        assert!(HexPrefix::new("").unwrap().matches(&id));
-        assert!(HexPrefix::new("1").unwrap().matches(&id));
-        assert!(HexPrefix::new("12").unwrap().matches(&id));
-        assert!(HexPrefix::new("123").unwrap().matches(&id));
-        assert!(HexPrefix::new("1234").unwrap().matches(&id));
-        assert!(!HexPrefix::new("12345").unwrap().matches(&id));
-
-        assert!(!HexPrefix::new("a").unwrap().matches(&id));
-        assert!(!HexPrefix::new("1a").unwrap().matches(&id));
-        assert!(!HexPrefix::new("12a").unwrap().matches(&id));
-        assert!(!HexPrefix::new("123a").unwrap().matches(&id));
-    }
+    /// This function returns the shortest length of a prefix of `key` that
+    /// disambiguates it from every other key in the index.
+    ///
+    /// The length returned is a number of hexadecimal digits.
+    ///
+    /// This has some properties that we do not currently make much use of:
+    ///
+    /// - The algorithm works even if `key` itself is not in the index.
+    ///
+    /// - In the special case when there are keys in the trie for which our
+    ///   `key` is an exact prefix, returns `key.len() + 1`. Conceptually, in
+    ///   order to disambiguate, you need every letter of the key *and* the
+    ///   additional fact that it's the entire key). This case is extremely
+    ///   unlikely for hashes with 12+ hexadecimal characters.
+    fn shortest_unique_prefix_len(&self, change_id: &ChangeId) -> usize;
 }

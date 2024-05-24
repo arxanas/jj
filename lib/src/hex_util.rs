@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
+#![allow(missing_docs)]
+
 fn to_reverse_hex_digit(b: u8) -> Option<u8> {
     let value = match b {
         b'0'..=b'9' => b - b'0',
@@ -48,7 +51,26 @@ pub fn to_reverse_hex(forward_hex: &str) -> Option<String> {
         .collect()
 }
 
-#[cfg(test)]
+/// Calculates common prefix length of two bytes. The length to be returned is
+/// a number of hexadecimal digits.
+pub fn common_hex_len(bytes_a: &[u8], bytes_b: &[u8]) -> usize {
+    iter_half_bytes(bytes_a)
+        .zip(iter_half_bytes(bytes_b))
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+fn iter_half_bytes(bytes: &[u8]) -> impl ExactSizeIterator<Item = u8> + '_ {
+    (0..bytes.len() * 2).map(|i| {
+        let v = bytes[i / 2];
+        if i & 1 == 0 {
+            v >> 4
+        } else {
+            v & 0xf
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

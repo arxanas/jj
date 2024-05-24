@@ -16,21 +16,38 @@ syntax = "proto3";
 
 package op_store;
 
+message RefConflictLegacy {
+  repeated bytes removes = 1 [deprecated = true];
+  repeated bytes adds = 2 [deprecated = true];
+}
+
 message RefConflict {
-  repeated bytes removes = 1;
-  repeated bytes adds = 2;
+  message Term {
+    optional bytes value = 1;
+  }
+  repeated Term removes = 1;
+  repeated Term adds = 2;
 }
 
 message RefTarget {
+  // New `RefConflict` type represents both `commit_id` and `conflict_legacy`.
   oneof value {
-    bytes commit_id = 1;
-    RefConflict conflict = 2;
+    bytes commit_id = 1 [deprecated = true];
+    RefConflictLegacy conflict_legacy = 2 [deprecated = true];
+    RefConflict conflict = 3;
   }
+}
+
+enum RemoteRefState {
+  New = 0;
+  Tracking = 1;
 }
 
 message RemoteBranch {
   string remote_name = 1;
   RefTarget target = 2;
+  // Introduced in jj 0.11.
+  optional RemoteRefState state = 3;
 }
 
 message Branch {
@@ -60,7 +77,7 @@ message Tag {
 
 message View {
   repeated bytes head_ids = 1;
-  repeated bytes public_head_ids = 4;
+  reserved 4;
   bytes wc_commit_id = 2 [deprecated = true];
   map<string, bytes> wc_commit_ids = 8;
   repeated Branch branches = 5;
@@ -72,6 +89,8 @@ message View {
   // TODO: Delete support for the old format.
   bytes git_head_legacy = 7 [deprecated = true];
   RefTarget git_head = 9;
+  // Whether "@git" branches have been migrated to remote_targets.
+  bool has_git_refs_migrated_to_remote = 10;
 }
 
 message Operation {
@@ -92,5 +111,6 @@ message OperationMetadata {
   string description = 3;
   string hostname = 4;
   string username = 5;
+  bool is_snapshot = 7;
   map<string, string> tags = 6;
 }

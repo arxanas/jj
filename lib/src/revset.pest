@@ -12,31 +12,48 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-identifier_part = @{ (ASCII_ALPHANUMERIC | "_" | "@" | "/")+ }
+whitespace = _{ " " | "\t" | "\r" | "\n" | "\x0c" }
+
+identifier_part = @{ (ASCII_ALPHANUMERIC | "_" | "/")+ }
 identifier = @{
-  identifier_part ~ ("." | "-" | "+" ) ~ identifier
-  | identifier_part
+  identifier_part ~ (("." | "-" | "+") ~ identifier_part)*
 }
 symbol = {
   identifier
-  | literal_string
+  | string_literal
+  | raw_string_literal
 }
-literal_string = { "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
-whitespace = _{ " " | "\t" | "\r" | "\n" | "\x0c" }
+
+string_escape = @{ "\\" ~ ("t" | "r" | "n" | "0" | "\"" | "\\") }
+string_content_char = @{ !("\"" | "\\") ~ ANY }
+string_content = @{ string_content_char+ }
+string_literal = ${ "\"" ~ (string_content | string_escape)* ~ "\"" }
+
+raw_string_content = @{ (!"'" ~ ANY)* }
+raw_string_literal = ${ "'" ~ raw_string_content ~ "'" }
+
+at_op = { "@" }
+pattern_kind_op = { ":" }
 
 parents_op = { "-" }
 children_op = { "+" }
 compat_parents_op = { "^" }
 
-dag_range_op = { ":" }
-dag_range_pre_op = { ":" }
-dag_range_post_op = { ":" }
+dag_range_op = { "::" }
+dag_range_pre_op = { "::" }
+dag_range_post_op = { "::" }
+dag_range_all_op = { "::" }
+compat_dag_range_op = { ":" }
+compat_dag_range_pre_op = { ":" }
+compat_dag_range_post_op = { ":" }
 range_op = { ".." }
 range_pre_op = { ".." }
 range_post_op = { ".." }
-range_ops = _{ dag_range_op | range_op }
-range_pre_ops = _{ dag_range_pre_op | range_pre_op }
-range_post_ops = _{ dag_range_post_op | range_post_op }
+range_all_op = { ".." }
+range_ops = _{ dag_range_op | compat_dag_range_op | range_op }
+range_pre_ops = _{ dag_range_pre_op | compat_dag_range_pre_op | range_pre_op }
+range_post_ops = _{ dag_range_post_op | compat_dag_range_post_op | range_post_op }
+range_all_ops = _{ dag_range_all_op | range_all_op }
 
 negate_op = { "~" }
 union_op = { "|" }
@@ -58,10 +75,18 @@ formal_parameters = {
   | ""
 }
 
+// TODO: change rhs to string_literal to require quoting? #2101
+string_pattern = { identifier ~ pattern_kind_op ~ symbol }
+
 primary = {
   function_name ~ "(" ~ whitespace* ~ function_arguments ~ whitespace* ~ ")"
   | "(" ~ whitespace* ~ expression ~ whitespace* ~ ")"
+  | string_pattern
+  // "@" operator cannot be nested
+  | symbol ~ at_op ~ symbol
+  | symbol ~ at_op
   | symbol
+  | at_op
 }
 
 neighbors_expression = _{ primary ~ (parents_op | children_op | compat_parents_op)* }
@@ -71,6 +96,7 @@ range_expression = _{
   | neighbors_expression ~ range_post_ops
   | range_pre_ops ~ neighbors_expression
   | neighbors_expression
+  | range_all_ops
 }
 
 expression = {
@@ -79,6 +105,10 @@ expression = {
 }
 
 program = _{ SOI ~ whitespace* ~ expression ~ whitespace* ~ EOI }
+program_modifier = { identifier ~ pattern_kind_op ~ !":" }
+program_with_modifier = _{
+  SOI ~ whitespace* ~ (program_modifier ~ whitespace*)? ~ expression ~ whitespace* ~ EOI
+}
 
 alias_declaration_part = _{
   function_name ~ "(" ~ whitespace* ~ formal_parameters ~ whitespace* ~ ")"

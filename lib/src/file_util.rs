@@ -12,11 +12,62 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fs::File;
-use std::iter;
+#![allow(missing_docs)]
+
+use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
+use std::{io, iter};
 
 use tempfile::{NamedTempFile, PersistError};
+use thiserror::Error;
+
+pub use self::platform::*;
+
+#[derive(Debug, Error)]
+#[error("Cannot access {path}")]
+pub struct PathError {
+    pub path: PathBuf,
+    #[source]
+    pub error: io::Error,
+}
+
+pub(crate) trait IoResultExt<T> {
+    fn context(self, path: impl AsRef<Path>) -> Result<T, PathError>;
+}
+
+impl<T> IoResultExt<T> for io::Result<T> {
+    fn context(self, path: impl AsRef<Path>) -> Result<T, PathError> {
+        self.map_err(|error| PathError {
+            path: path.as_ref().to_path_buf(),
+            error,
+        })
+    }
+}
+
+/// Creates a directory or does nothing if the directory already exists.
+///
+/// Returns the underlying error if the directory can't be created.
+/// The function will also fail if intermediate directories on the path do not
+/// already exist.
+pub fn create_or_reuse_dir(dirname: &Path) -> io::Result<()> {
+    match fs::create_dir(dirname) {
+        Ok(()) => Ok(()),
+        Err(_) if dirname.is_dir() => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Removes all files in the directory, but not the directory itself.
+///
+/// The directory must exist, and there should be no sub directories.
+pub fn remove_dir_contents(dirname: &Path) -> Result<(), PathError> {
+    for entry in dirname.read_dir().context(dirname)? {
+        let entry = entry.context(dirname)?;
+        let path = entry.path();
+        fs::remove_file(&path).context(&path)?;
+    }
+    Ok(())
+}
 
 /// Turns the given `to` path into relative path starting from the `from` path.
 ///
@@ -66,21 +117,80 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     }
 }
 
-// Like NamedTempFile::persist(), but also succeeds if the target already
-// exists.
+/// Like `NamedTempFile::persist()`, but doesn't try to overwrite the existing
+/// target on Windows.
 pub fn persist_content_addressed_temp_file<P: AsRef<Path>>(
     temp_file: NamedTempFile,
     new_path: P,
-) -> Result<File, PersistError> {
-    match temp_file.persist(&new_path) {
-        Ok(file) => Ok(file),
-        Err(PersistError { error, file }) => {
-            if let Ok(existing_file) = File::open(new_path) {
-                Ok(existing_file)
-            } else {
-                Err(PersistError { error, file })
+) -> io::Result<File> {
+    if cfg!(windows) {
+        // On Windows, overwriting file can fail if the file is opened without
+        // FILE_SHARE_DELETE for example. We don't need to take a risk if the
+        // file already exists.
+        match temp_file.persist_noclobber(&new_path) {
+            Ok(file) => Ok(file),
+            Err(PersistError { error, file: _ }) => {
+                if let Ok(existing_file) = File::open(new_path) {
+                    // TODO: Update mtime to help GC keep this file
+                    Ok(existing_file)
+                } else {
+                    Err(error)
+                }
             }
         }
+    } else {
+        // On Unix, rename() is atomic and should succeed even if the
+        // destination file exists. Checking if the target exists might involve
+        // non-atomic operation, so don't use persist_noclobber().
+        temp_file
+            .persist(new_path)
+            .map_err(|PersistError { error, file: _ }| error)
+    }
+}
+
+#[cfg(unix)]
+mod platform {
+    use std::io;
+    use std::os::unix::fs::symlink;
+    use std::path::Path;
+
+    /// Symlinks are always available on UNIX
+    pub fn check_symlink_support() -> io::Result<bool> {
+        Ok(true)
+    }
+
+    pub fn try_symlink<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
+        symlink(original, link)
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use std::io;
+    use std::os::windows::fs::symlink_file;
+    use std::path::Path;
+
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+
+    /// Symlinks may or may not be enabled on Windows. They require the
+    /// Developer Mode setting, which is stored in the registry key below.
+    pub fn check_symlink_support() -> io::Result<bool> {
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+        let sideloading =
+            hklm.open_subkey("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock")?;
+        let developer_mode: u32 = sideloading.get_value("AllowDevelopmentWithoutDevLicense")?;
+        Ok(developer_mode == 1)
+    }
+
+    pub fn try_symlink<P: AsRef<Path>, Q: AsRef<Path>>(original: P, link: Q) -> io::Result<()> {
+        // this will create a nonfunctional link for directories, but at the moment
+        // we don't have enough information in the tree to determine whether the
+        // symlink target is a file or a directory
+        // note: if developer mode is not enabled the error code will be 1314,
+        // ERROR_PRIVILEGE_NOT_HELD
+
+        symlink_file(original, link)
     }
 }
 

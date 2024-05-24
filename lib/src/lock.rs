@@ -12,69 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
-use std::time::Duration;
+#![allow(missing_docs)]
 
-use backoff::{retry, ExponentialBackoff};
+#[cfg_attr(unix, path = "lock/unix.rs")]
+#[cfg_attr(not(unix), path = "lock/fallback.rs")]
+mod platform;
 
-pub struct FileLock {
-    path: PathBuf,
-    _file: File,
-}
-
-impl FileLock {
-    pub fn lock(path: PathBuf) -> FileLock {
-        let mut options = OpenOptions::new();
-        options.create_new(true);
-        options.write(true);
-        let try_write_lock_file = || match options.open(&path) {
-            Ok(file) => Ok(FileLock {
-                path: path.clone(),
-                _file: file,
-            }),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(backoff::Error::Transient {
-                    err,
-                    retry_after: None,
-                })
-            }
-            Err(err) if cfg!(windows) && err.kind() == std::io::ErrorKind::PermissionDenied => {
-                Err(backoff::Error::Transient {
-                    err,
-                    retry_after: None,
-                })
-            }
-            Err(err) => Err(backoff::Error::Permanent(err)),
-        };
-        let backoff = ExponentialBackoff {
-            initial_interval: Duration::from_millis(1),
-            max_elapsed_time: Some(Duration::from_secs(10)),
-            ..Default::default()
-        };
-        match retry(backoff, try_write_lock_file) {
-            Err(err) => panic!(
-                "failed to create lock file {}: {}",
-                path.to_string_lossy(),
-                err
-            ),
-            Ok(file_lock) => file_lock,
-        }
-    }
-}
-
-impl Drop for FileLock {
-    fn drop(&mut self) {
-        std::fs::remove_file(&self.path).expect("failed to delete lock file");
-    }
-}
+pub use platform::FileLock;
 
 #[cfg(test)]
 mod tests {
     use std::cmp::max;
-    use std::thread;
-
-    use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+    use std::time::Duration;
+    use std::{fs, thread};
 
     use super::*;
 
@@ -95,35 +45,21 @@ mod tests {
         let temp_dir = testutils::new_temp_dir();
         let data_path = temp_dir.path().join("test");
         let lock_path = temp_dir.path().join("test.lock");
-        let mut data_file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(data_path.clone())
-            .unwrap();
-        data_file.write_u32::<LittleEndian>(0).unwrap();
+        fs::write(&data_path, 0_u32.to_le_bytes()).unwrap();
         let num_threads = max(num_cpus::get(), 4);
-        let mut threads = vec![];
-        for _ in 0..num_threads {
-            let data_path = data_path.clone();
-            let lock_path = lock_path.clone();
-            let handle = thread::spawn(move || {
-                let _lock = FileLock::lock(lock_path);
-                let mut data_file = OpenOptions::new()
-                    .read(true)
-                    .open(data_path.clone())
-                    .unwrap();
-                let value = data_file.read_u32::<LittleEndian>().unwrap();
-                thread::sleep(Duration::from_millis(1));
-                let mut data_file = OpenOptions::new().write(true).open(data_path).unwrap();
-                data_file.write_u32::<LittleEndian>(value + 1).unwrap();
-            });
-            threads.push(handle);
-        }
-        for thread in threads {
-            thread.join().ok().unwrap();
-        }
-        let mut data_file = OpenOptions::new().read(true).open(data_path).unwrap();
-        let value = data_file.read_u32::<LittleEndian>().unwrap();
+        thread::scope(|s| {
+            for _ in 0..num_threads {
+                s.spawn(|| {
+                    let _lock = FileLock::lock(lock_path.clone());
+                    let data = fs::read(&data_path).unwrap();
+                    let value = u32::from_le_bytes(data.try_into().unwrap());
+                    thread::sleep(Duration::from_millis(1));
+                    fs::write(&data_path, (value + 1).to_le_bytes()).unwrap();
+                });
+            }
+        });
+        let data = fs::read(&data_path).unwrap();
+        let value = u32::from_le_bytes(data.try_into().unwrap());
         assert_eq!(value, num_threads as u32);
     }
 }

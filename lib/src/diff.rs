@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(missing_docs)]
+
 use std::cmp::{max, min, Ordering};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{Debug, Formatter};
@@ -19,8 +21,6 @@ use std::ops::Range;
 use std::slice;
 
 use itertools::Itertools;
-
-use crate::nightly_shims::BTreeMapExt;
 
 pub fn find_line_ranges(text: &[u8]) -> Vec<Range<usize>> {
     let mut ranges = vec![];
@@ -183,7 +183,7 @@ pub(crate) fn unchanged_ranges(
 
     let max_occurrences = 100;
     let mut left_histogram = Histogram::calculate(left, left_ranges, max_occurrences);
-    if *left_histogram.count_to_words.first_key().unwrap() > max_occurrences {
+    if *left_histogram.count_to_words.keys().next().unwrap() > max_occurrences {
         // If there are very many occurrences of all words, then we just give up.
         return vec![];
     }
@@ -193,7 +193,11 @@ pub(crate) fn unchanged_ranges(
     // the LCS.
     let mut uncommon_shared_words = vec![];
     while !left_histogram.count_to_words.is_empty() && uncommon_shared_words.is_empty() {
-        let left_words = left_histogram.count_to_words.pop_first_value().unwrap();
+        let left_words = left_histogram
+            .count_to_words
+            .first_entry()
+            .map(|x| x.remove())
+            .unwrap();
         for left_word in left_words {
             if right_histogram.word_to_positions.contains_key(left_word) {
                 uncommon_shared_words.push(left_word);
@@ -635,9 +639,15 @@ pub fn diff<'a>(left: &'a [u8], right: &'a [u8]) -> Vec<DiffHunk<'a>> {
 mod tests {
     use super::*;
 
+    // Extracted to a function because type inference is ambiguous due to
+    // `impl PartialEq<aho_corasick::util::search::Span> for std::ops::Range<usize>`
+    fn no_ranges() -> Vec<Range<usize>> {
+        vec![]
+    }
+
     #[test]
     fn test_find_line_ranges_empty() {
-        assert_eq!(find_line_ranges(b""), vec![]);
+        assert_eq!(find_line_ranges(b""), no_ranges());
     }
 
     #[test]
@@ -657,7 +667,7 @@ mod tests {
 
     #[test]
     fn test_find_word_ranges_empty() {
-        assert_eq!(find_word_ranges(b""), vec![]);
+        assert_eq!(find_word_ranges(b""), no_ranges());
     }
 
     #[test]
@@ -667,7 +677,7 @@ mod tests {
 
     #[test]
     fn test_find_word_ranges_no_word() {
-        assert_eq!(find_word_ranges(b"+-*/"), vec![]);
+        assert_eq!(find_word_ranges(b"+-*/"), no_ranges());
     }
 
     #[test]

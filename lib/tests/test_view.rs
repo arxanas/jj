@@ -12,45 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
 
-use jujutsu_lib::op_store::{BranchTarget, RefTarget, WorkspaceId};
-use jujutsu_lib::repo::{ReadonlyRepo, Repo};
-use jujutsu_lib::settings::UserSettings;
-use jujutsu_lib::transaction::Transaction;
+use jj_lib::op_store::{BranchTarget, RefTarget, RemoteRef, RemoteRefState, WorkspaceId};
+use jj_lib::repo::Repo;
 use maplit::{btreemap, hashset};
 use test_case::test_case;
-use testutils::{create_random_commit, write_random_commit, CommitGraphBuilder, TestRepo};
+use testutils::{
+    commit_transactions, create_random_commit, write_random_commit, CommitGraphBuilder, TestRepo,
+};
 
-#[test_case(false ; "local backend")]
-#[test_case(true ; "git backend")]
-fn test_heads_empty(use_git: bool) {
-    let test_repo = TestRepo::init(use_git);
+#[test]
+fn test_heads_empty() {
+    let test_repo = TestRepo::init();
     let repo = &test_repo.repo;
 
     assert_eq!(
         *repo.view().heads(),
         hashset! {repo.store().root_commit_id().clone()}
     );
-    assert_eq!(
-        *repo.view().public_heads(),
-        hashset! {repo.store().root_commit_id().clone()}
-    );
 }
 
-#[test_case(false ; "local backend")]
-#[test_case(true ; "git backend")]
-fn test_heads_fork(use_git: bool) {
+#[test]
+fn test_heads_fork() {
     let settings = testutils::user_settings();
-    let test_repo = TestRepo::init(use_git);
+    let test_repo = TestRepo::init();
     let repo = &test_repo.repo;
-    let mut tx = repo.start_transaction(&settings, "test");
+    let mut tx = repo.start_transaction(&settings);
 
     let mut graph_builder = CommitGraphBuilder::new(&settings, tx.mut_repo());
     let initial = graph_builder.initial_commit();
     let child1 = graph_builder.commit_with_parents(&[&initial]);
     let child2 = graph_builder.commit_with_parents(&[&initial]);
-    let repo = tx.commit();
+    let repo = tx.commit("test");
 
     assert_eq!(
         *repo.view().heads(),
@@ -61,20 +55,19 @@ fn test_heads_fork(use_git: bool) {
     );
 }
 
-#[test_case(false ; "local backend")]
-#[test_case(true ; "git backend")]
-fn test_heads_merge(use_git: bool) {
+#[test]
+fn test_heads_merge() {
     let settings = testutils::user_settings();
-    let test_repo = TestRepo::init(use_git);
+    let test_repo = TestRepo::init();
     let repo = &test_repo.repo;
-    let mut tx = repo.start_transaction(&settings, "test");
+    let mut tx = repo.start_transaction(&settings);
 
     let mut graph_builder = CommitGraphBuilder::new(&settings, tx.mut_repo());
     let initial = graph_builder.initial_commit();
     let child1 = graph_builder.commit_with_parents(&[&initial]);
     let child2 = graph_builder.commit_with_parents(&[&initial]);
     let merge = graph_builder.commit_with_parents(&[&child1, &child2]);
-    let repo = tx.commit();
+    let repo = tx.commit("test");
 
     assert_eq!(*repo.view().heads(), hashset! {merge.id().clone()});
 }
@@ -83,67 +76,39 @@ fn test_heads_merge(use_git: bool) {
 fn test_merge_views_heads() {
     // Tests merging of the view's heads (by performing concurrent operations).
     let settings = testutils::user_settings();
-    let test_repo = TestRepo::init(false);
+    let test_repo = TestRepo::init();
     let repo = &test_repo.repo;
 
-    let mut tx = repo.start_transaction(&settings, "test");
+    let mut tx = repo.start_transaction(&settings);
     let mut_repo = tx.mut_repo();
     let head_unchanged = write_random_commit(mut_repo, &settings);
     let head_remove_tx1 = write_random_commit(mut_repo, &settings);
     let head_remove_tx2 = write_random_commit(mut_repo, &settings);
-    let public_head_unchanged = write_random_commit(mut_repo, &settings);
-    mut_repo.add_public_head(&public_head_unchanged);
-    let public_head_remove_tx1 = write_random_commit(mut_repo, &settings);
-    mut_repo.add_public_head(&public_head_remove_tx1);
-    let public_head_remove_tx2 = write_random_commit(mut_repo, &settings);
-    mut_repo.add_public_head(&public_head_remove_tx2);
-    let repo = tx.commit();
+    let repo = tx.commit("test");
 
-    let mut tx1 = repo.start_transaction(&settings, "test");
+    let mut tx1 = repo.start_transaction(&settings);
     tx1.mut_repo().remove_head(head_remove_tx1.id());
-    tx1.mut_repo()
-        .remove_public_head(public_head_remove_tx1.id());
     let head_add_tx1 = write_random_commit(tx1.mut_repo(), &settings);
-    let public_head_add_tx1 = write_random_commit(tx1.mut_repo(), &settings);
-    tx1.mut_repo().add_public_head(&public_head_add_tx1);
-    tx1.commit();
 
-    let mut tx2 = repo.start_transaction(&settings, "test");
+    let mut tx2 = repo.start_transaction(&settings);
     tx2.mut_repo().remove_head(head_remove_tx2.id());
-    tx2.mut_repo()
-        .remove_public_head(public_head_remove_tx2.id());
     let head_add_tx2 = write_random_commit(tx2.mut_repo(), &settings);
-    let public_head_add_tx2 = write_random_commit(tx2.mut_repo(), &settings);
-    tx2.mut_repo().add_public_head(&public_head_add_tx2);
-    tx2.commit();
 
-    let repo = repo.reload_at_head(&settings).unwrap();
+    let repo = commit_transactions(&settings, vec![tx1, tx2]);
 
     let expected_heads = hashset! {
         head_unchanged.id().clone(),
         head_add_tx1.id().clone(),
         head_add_tx2.id().clone(),
-        public_head_unchanged.id().clone(),
-        public_head_remove_tx1.id().clone(),
-        public_head_remove_tx2.id().clone(),
-        public_head_add_tx1.id().clone(),
-        public_head_add_tx2.id().clone(),
     };
     assert_eq!(repo.view().heads(), &expected_heads);
-
-    let expected_public_heads = hashset! {
-        public_head_unchanged.id().clone(),
-        public_head_add_tx1.id().clone(),
-        public_head_add_tx2.id().clone(),
-    };
-    assert_eq!(repo.view().public_heads(), &expected_public_heads);
 }
 
 #[test]
 fn test_merge_views_checkout() {
     // Tests merging of the view's checkout (by performing concurrent operations).
     let settings = testutils::user_settings();
-    let test_repo = TestRepo::init(false);
+    let test_repo = TestRepo::init();
     let repo = &test_repo.repo;
 
     // Workspace 1 gets updated in both transactions.
@@ -153,7 +118,7 @@ fn test_merge_views_checkout() {
     // Workspace 5 gets deleted in tx2 and modified in tx1.
     // Workspace 6 gets added in tx1.
     // Workspace 7 gets added in tx2.
-    let mut initial_tx = repo.start_transaction(&settings, "test");
+    let mut initial_tx = repo.start_transaction(&settings);
     let commit1 = write_random_commit(initial_tx.mut_repo(), &settings);
     let commit2 = write_random_commit(initial_tx.mut_repo(), &settings);
     let commit3 = write_random_commit(initial_tx.mut_repo(), &settings);
@@ -184,9 +149,9 @@ fn test_merge_views_checkout() {
         .mut_repo()
         .set_wc_commit(ws5_id.clone(), commit1.id().clone())
         .unwrap();
-    let repo = initial_tx.commit();
+    let repo = initial_tx.commit("test");
 
-    let mut tx1 = repo.start_transaction(&settings, "test");
+    let mut tx1 = repo.start_transaction(&settings);
     tx1.mut_repo()
         .set_wc_commit(ws1_id.clone(), commit2.id().clone())
         .unwrap();
@@ -200,9 +165,8 @@ fn test_merge_views_checkout() {
     tx1.mut_repo()
         .set_wc_commit(ws6_id.clone(), commit2.id().clone())
         .unwrap();
-    tx1.commit();
 
-    let mut tx2 = repo.start_transaction(&settings, "test");
+    let mut tx2 = repo.start_transaction(&settings);
     tx2.mut_repo()
         .set_wc_commit(ws1_id.clone(), commit3.id().clone())
         .unwrap();
@@ -216,12 +180,8 @@ fn test_merge_views_checkout() {
     tx2.mut_repo()
         .set_wc_commit(ws7_id.clone(), commit3.id().clone())
         .unwrap();
-    // Make sure the end time different, assuming the clock has sub-millisecond
-    // precision.
-    std::thread::sleep(std::time::Duration::from_millis(1));
-    tx2.commit();
 
-    let repo = repo.reload_at_head(&settings).unwrap();
+    let repo = commit_transactions(&settings, vec![tx1, tx2]);
 
     // We currently arbitrarily pick the first transaction's working-copy commit
     // (first by transaction end time).
@@ -239,90 +199,89 @@ fn test_merge_views_branches() {
     // Tests merging of branches (by performing concurrent operations). See
     // test_refs.rs for tests of merging of individual ref targets.
     let settings = testutils::user_settings();
-    let test_repo = TestRepo::init(false);
+    let test_repo = TestRepo::init();
     let repo = &test_repo.repo;
 
-    let mut tx = repo.start_transaction(&settings, "test");
+    let mut tx = repo.start_transaction(&settings);
     let mut_repo = tx.mut_repo();
     let main_branch_local_tx0 = write_random_commit(mut_repo, &settings);
     let main_branch_origin_tx0 = write_random_commit(mut_repo, &settings);
-    let main_branch_origin_tx1 = write_random_commit(mut_repo, &settings);
     let main_branch_alternate_tx0 = write_random_commit(mut_repo, &settings);
-    mut_repo.set_local_branch(
-        "main".to_string(),
-        RefTarget::Normal(main_branch_local_tx0.id().clone()),
+    let main_branch_origin_tx0_remote_ref = RemoteRef {
+        target: RefTarget::normal(main_branch_origin_tx0.id().clone()),
+        state: RemoteRefState::New,
+    };
+    let main_branch_alternate_tx0_remote_ref = RemoteRef {
+        target: RefTarget::normal(main_branch_alternate_tx0.id().clone()),
+        state: RemoteRefState::Tracking,
+    };
+    mut_repo.set_local_branch_target(
+        "main",
+        RefTarget::normal(main_branch_local_tx0.id().clone()),
     );
+    mut_repo.set_remote_branch("main", "origin", main_branch_origin_tx0_remote_ref);
     mut_repo.set_remote_branch(
-        "main".to_string(),
-        "origin".to_string(),
-        RefTarget::Normal(main_branch_origin_tx0.id().clone()),
-    );
-    mut_repo.set_remote_branch(
-        "main".to_string(),
-        "alternate".to_string(),
-        RefTarget::Normal(main_branch_alternate_tx0.id().clone()),
+        "main",
+        "alternate",
+        main_branch_alternate_tx0_remote_ref.clone(),
     );
     let feature_branch_local_tx0 = write_random_commit(mut_repo, &settings);
-    mut_repo.set_git_ref(
-        "feature".to_string(),
-        RefTarget::Normal(feature_branch_local_tx0.id().clone()),
+    mut_repo.set_local_branch_target(
+        "feature",
+        RefTarget::normal(feature_branch_local_tx0.id().clone()),
     );
-    let repo = tx.commit();
+    let repo = tx.commit("test");
 
-    let mut tx1 = repo.start_transaction(&settings, "test");
+    let mut tx1 = repo.start_transaction(&settings);
     let main_branch_local_tx1 = write_random_commit(tx1.mut_repo(), &settings);
-    tx1.mut_repo().set_local_branch(
-        "main".to_string(),
-        RefTarget::Normal(main_branch_local_tx1.id().clone()),
-    );
-    tx1.mut_repo().set_remote_branch(
-        "main".to_string(),
-        "origin".to_string(),
-        RefTarget::Normal(main_branch_origin_tx1.id().clone()),
+    tx1.mut_repo().set_local_branch_target(
+        "main",
+        RefTarget::normal(main_branch_local_tx1.id().clone()),
     );
     let feature_branch_tx1 = write_random_commit(tx1.mut_repo(), &settings);
-    tx1.mut_repo().set_local_branch(
-        "feature".to_string(),
-        RefTarget::Normal(feature_branch_tx1.id().clone()),
+    tx1.mut_repo().set_local_branch_target(
+        "feature",
+        RefTarget::normal(feature_branch_tx1.id().clone()),
     );
-    tx1.commit();
 
-    let mut tx2 = repo.start_transaction(&settings, "test");
+    let mut tx2 = repo.start_transaction(&settings);
     let main_branch_local_tx2 = write_random_commit(tx2.mut_repo(), &settings);
-    tx2.mut_repo().set_local_branch(
-        "main".to_string(),
-        RefTarget::Normal(main_branch_local_tx2.id().clone()),
+    let main_branch_origin_tx2 = write_random_commit(tx2.mut_repo(), &settings);
+    let main_branch_origin_tx2_remote_ref = RemoteRef {
+        target: RefTarget::normal(main_branch_origin_tx2.id().clone()),
+        state: RemoteRefState::Tracking,
+    };
+    tx2.mut_repo().set_local_branch_target(
+        "main",
+        RefTarget::normal(main_branch_local_tx2.id().clone()),
     );
-    tx2.mut_repo().set_remote_branch(
-        "main".to_string(),
-        "origin".to_string(),
-        RefTarget::Normal(main_branch_origin_tx1.id().clone()),
-    );
-    tx2.commit();
+    tx2.mut_repo()
+        .set_remote_branch("main", "origin", main_branch_origin_tx2_remote_ref.clone());
 
-    let repo = repo.reload_at_head(&settings).unwrap();
+    let repo = commit_transactions(&settings, vec![tx1, tx2]);
     let expected_main_branch = BranchTarget {
-        local_target: Some(RefTarget::Conflict {
-            removes: vec![main_branch_local_tx0.id().clone()],
-            adds: vec![
+        local_target: &RefTarget::from_legacy_form(
+            [main_branch_local_tx0.id().clone()],
+            [
                 main_branch_local_tx1.id().clone(),
                 main_branch_local_tx2.id().clone(),
             ],
-        }),
-        remote_targets: btreemap! {
-            "origin".to_string() => RefTarget::Normal(main_branch_origin_tx1.id().clone()),
-            "alternate".to_string() => RefTarget::Normal(main_branch_alternate_tx0.id().clone()),
-        },
+        ),
+        remote_refs: vec![
+            ("alternate", &main_branch_alternate_tx0_remote_ref),
+            // tx1: unchanged, tx2: new -> tracking
+            ("origin", &main_branch_origin_tx2_remote_ref),
+        ],
     };
     let expected_feature_branch = BranchTarget {
-        local_target: Some(RefTarget::Normal(feature_branch_tx1.id().clone())),
-        remote_targets: btreemap! {},
+        local_target: &RefTarget::normal(feature_branch_tx1.id().clone()),
+        remote_refs: vec![],
     };
     assert_eq!(
-        repo.view().branches(),
-        &btreemap! {
-            "main".to_string() => expected_main_branch,
-            "feature".to_string() => expected_feature_branch,
+        repo.view().branches().collect::<BTreeMap<_, _>>(),
+        btreemap! {
+            "main" => expected_main_branch,
+            "feature" => expected_feature_branch,
         }
     );
 }
@@ -332,38 +291,36 @@ fn test_merge_views_tags() {
     // Tests merging of tags (by performing concurrent operations). See
     // test_refs.rs for tests of merging of individual ref targets.
     let settings = testutils::user_settings();
-    let test_repo = TestRepo::init(false);
+    let test_repo = TestRepo::init();
     let repo = &test_repo.repo;
 
-    let mut tx = repo.start_transaction(&settings, "test");
+    let mut tx = repo.start_transaction(&settings);
     let mut_repo = tx.mut_repo();
     let v1_tx0 = write_random_commit(mut_repo, &settings);
-    mut_repo.set_tag("v1.0".to_string(), RefTarget::Normal(v1_tx0.id().clone()));
+    mut_repo.set_tag_target("v1.0", RefTarget::normal(v1_tx0.id().clone()));
     let v2_tx0 = write_random_commit(mut_repo, &settings);
-    mut_repo.set_tag("v2.0".to_string(), RefTarget::Normal(v2_tx0.id().clone()));
-    let repo = tx.commit();
+    mut_repo.set_tag_target("v2.0", RefTarget::normal(v2_tx0.id().clone()));
+    let repo = tx.commit("test");
 
-    let mut tx1 = repo.start_transaction(&settings, "test");
+    let mut tx1 = repo.start_transaction(&settings);
     let v1_tx1 = write_random_commit(tx1.mut_repo(), &settings);
     tx1.mut_repo()
-        .set_tag("v1.0".to_string(), RefTarget::Normal(v1_tx1.id().clone()));
+        .set_tag_target("v1.0", RefTarget::normal(v1_tx1.id().clone()));
     let v2_tx1 = write_random_commit(tx1.mut_repo(), &settings);
     tx1.mut_repo()
-        .set_tag("v2.0".to_string(), RefTarget::Normal(v2_tx1.id().clone()));
-    tx1.commit();
+        .set_tag_target("v2.0", RefTarget::normal(v2_tx1.id().clone()));
 
-    let mut tx2 = repo.start_transaction(&settings, "test");
+    let mut tx2 = repo.start_transaction(&settings);
     let v1_tx2 = write_random_commit(tx2.mut_repo(), &settings);
     tx2.mut_repo()
-        .set_tag("v1.0".to_string(), RefTarget::Normal(v1_tx2.id().clone()));
-    tx2.commit();
+        .set_tag_target("v1.0", RefTarget::normal(v1_tx2.id().clone()));
 
-    let repo = repo.reload_at_head(&settings).unwrap();
-    let expected_v1 = RefTarget::Conflict {
-        removes: vec![v1_tx0.id().clone()],
-        adds: vec![v1_tx1.id().clone(), v1_tx2.id().clone()],
-    };
-    let expected_v2 = RefTarget::Normal(v2_tx1.id().clone());
+    let repo = commit_transactions(&settings, vec![tx1, tx2]);
+    let expected_v1 = RefTarget::from_legacy_form(
+        [v1_tx0.id().clone()],
+        [v1_tx1.id().clone(), v1_tx2.id().clone()],
+    );
+    let expected_v2 = RefTarget::normal(v2_tx1.id().clone());
     assert_eq!(
         repo.view().tags(),
         &btreemap! {
@@ -378,50 +335,48 @@ fn test_merge_views_git_refs() {
     // Tests merging of git refs (by performing concurrent operations). See
     // test_refs.rs for tests of merging of individual ref targets.
     let settings = testutils::user_settings();
-    let test_repo = TestRepo::init(false);
+    let test_repo = TestRepo::init();
     let repo = &test_repo.repo;
 
-    let mut tx = repo.start_transaction(&settings, "test");
+    let mut tx = repo.start_transaction(&settings);
     let mut_repo = tx.mut_repo();
     let main_branch_tx0 = write_random_commit(mut_repo, &settings);
-    mut_repo.set_git_ref(
-        "refs/heads/main".to_string(),
-        RefTarget::Normal(main_branch_tx0.id().clone()),
+    mut_repo.set_git_ref_target(
+        "refs/heads/main",
+        RefTarget::normal(main_branch_tx0.id().clone()),
     );
     let feature_branch_tx0 = write_random_commit(mut_repo, &settings);
-    mut_repo.set_git_ref(
-        "refs/heads/feature".to_string(),
-        RefTarget::Normal(feature_branch_tx0.id().clone()),
+    mut_repo.set_git_ref_target(
+        "refs/heads/feature",
+        RefTarget::normal(feature_branch_tx0.id().clone()),
     );
-    let repo = tx.commit();
+    let repo = tx.commit("test");
 
-    let mut tx1 = repo.start_transaction(&settings, "test");
+    let mut tx1 = repo.start_transaction(&settings);
     let main_branch_tx1 = write_random_commit(tx1.mut_repo(), &settings);
-    tx1.mut_repo().set_git_ref(
-        "refs/heads/main".to_string(),
-        RefTarget::Normal(main_branch_tx1.id().clone()),
+    tx1.mut_repo().set_git_ref_target(
+        "refs/heads/main",
+        RefTarget::normal(main_branch_tx1.id().clone()),
     );
     let feature_branch_tx1 = write_random_commit(tx1.mut_repo(), &settings);
-    tx1.mut_repo().set_git_ref(
-        "refs/heads/feature".to_string(),
-        RefTarget::Normal(feature_branch_tx1.id().clone()),
+    tx1.mut_repo().set_git_ref_target(
+        "refs/heads/feature",
+        RefTarget::normal(feature_branch_tx1.id().clone()),
     );
-    tx1.commit();
 
-    let mut tx2 = repo.start_transaction(&settings, "test");
+    let mut tx2 = repo.start_transaction(&settings);
     let main_branch_tx2 = write_random_commit(tx2.mut_repo(), &settings);
-    tx2.mut_repo().set_git_ref(
-        "refs/heads/main".to_string(),
-        RefTarget::Normal(main_branch_tx2.id().clone()),
+    tx2.mut_repo().set_git_ref_target(
+        "refs/heads/main",
+        RefTarget::normal(main_branch_tx2.id().clone()),
     );
-    tx2.commit();
 
-    let repo = repo.reload_at_head(&settings).unwrap();
-    let expected_main_branch = RefTarget::Conflict {
-        removes: vec![main_branch_tx0.id().clone()],
-        adds: vec![main_branch_tx1.id().clone(), main_branch_tx2.id().clone()],
-    };
-    let expected_feature_branch = RefTarget::Normal(feature_branch_tx1.id().clone());
+    let repo = commit_transactions(&settings, vec![tx1, tx2]);
+    let expected_main_branch = RefTarget::from_legacy_form(
+        [main_branch_tx0.id().clone()],
+        [main_branch_tx1.id().clone(), main_branch_tx2.id().clone()],
+    );
+    let expected_feature_branch = RefTarget::normal(feature_branch_tx1.id().clone());
     assert_eq!(
         repo.view().git_refs(),
         &btreemap! {
@@ -436,50 +391,31 @@ fn test_merge_views_git_heads() {
     // Tests merging of git heads (by performing concurrent operations). See
     // test_refs.rs for tests of merging of individual ref targets.
     let settings = testutils::user_settings();
-    let test_repo = TestRepo::init(false);
+    let test_repo = TestRepo::init();
     let repo = &test_repo.repo;
 
-    let mut tx0 = repo.start_transaction(&settings, "test");
+    let mut tx0 = repo.start_transaction(&settings);
     let tx0_head = write_random_commit(tx0.mut_repo(), &settings);
     tx0.mut_repo()
-        .set_git_head(RefTarget::Normal(tx0_head.id().clone()));
-    let repo = tx0.commit();
+        .set_git_head_target(RefTarget::normal(tx0_head.id().clone()));
+    let repo = tx0.commit("test");
 
-    let mut tx1 = repo.start_transaction(&settings, "test");
+    let mut tx1 = repo.start_transaction(&settings);
     let tx1_head = write_random_commit(tx1.mut_repo(), &settings);
     tx1.mut_repo()
-        .set_git_head(RefTarget::Normal(tx1_head.id().clone()));
-    tx1.commit();
+        .set_git_head_target(RefTarget::normal(tx1_head.id().clone()));
 
-    let mut tx2 = repo.start_transaction(&settings, "test");
+    let mut tx2 = repo.start_transaction(&settings);
     let tx2_head = write_random_commit(tx2.mut_repo(), &settings);
     tx2.mut_repo()
-        .set_git_head(RefTarget::Normal(tx2_head.id().clone()));
-    tx2.commit();
+        .set_git_head_target(RefTarget::normal(tx2_head.id().clone()));
 
-    let repo = repo.reload_at_head(&settings).unwrap();
-    let expected_git_head = RefTarget::Conflict {
-        removes: vec![tx0_head.id().clone()],
-        adds: vec![tx1_head.id().clone(), tx2_head.id().clone()],
-    };
-    assert_eq!(repo.view().git_head(), Some(&expected_git_head));
-}
-
-fn commit_transactions(settings: &UserSettings, txs: Vec<Transaction>) -> Arc<ReadonlyRepo> {
-    let repo_loader = txs[0].base_repo().loader();
-    let mut op_ids = vec![];
-    for tx in txs {
-        op_ids.push(tx.commit().op_id().clone());
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    let repo = repo_loader.load_at_head(settings).unwrap();
-    // Test the setup. The assumption here is that the parent order matches the
-    // order in which they were merged (which currently matches the transaction
-    // commit order), so we want to know make sure they appear in a certain
-    // order, so the caller can decide the order by passing them to this
-    // function in a certain order.
-    assert_eq!(*repo.operation().parent_ids(), op_ids);
-    repo
+    let repo = commit_transactions(&settings, vec![tx1, tx2]);
+    let expected_git_head = RefTarget::from_legacy_form(
+        [tx0_head.id().clone()],
+        [tx1_head.id().clone(), tx2_head.id().clone()],
+    );
+    assert_eq!(repo.view().git_head(), &expected_git_head);
 }
 
 #[test]
@@ -487,13 +423,13 @@ fn test_merge_views_divergent() {
     // We start with just commit A. Operation 1 rewrites it as A2. Operation 2
     // rewrites it as A3.
     let settings = testutils::user_settings();
-    let test_repo = TestRepo::init(false);
+    let test_repo = TestRepo::init();
 
-    let mut tx = test_repo.repo.start_transaction(&settings, "test");
+    let mut tx = test_repo.repo.start_transaction(&settings);
     let commit_a = write_random_commit(tx.mut_repo(), &settings);
-    let repo = tx.commit();
+    let repo = tx.commit("test");
 
-    let mut tx1 = repo.start_transaction(&settings, "test");
+    let mut tx1 = repo.start_transaction(&settings);
     let commit_a2 = tx1
         .mut_repo()
         .rewrite_commit(&settings, &commit_a)
@@ -502,7 +438,7 @@ fn test_merge_views_divergent() {
         .unwrap();
     tx1.mut_repo().rebase_descendants(&settings).unwrap();
 
-    let mut tx2 = repo.start_transaction(&settings, "test");
+    let mut tx2 = repo.start_transaction(&settings);
     let commit_a3 = tx2
         .mut_repo()
         .rewrite_commit(&settings, &commit_a)
@@ -526,19 +462,19 @@ fn test_merge_views_child_on_rewritten(child_first: bool) {
     // We start with just commit A. Operation 1 adds commit B on top. Operation 2
     // rewrites A as A2.
     let settings = testutils::user_settings();
-    let test_repo = TestRepo::init(false);
+    let test_repo = TestRepo::init();
 
-    let mut tx = test_repo.repo.start_transaction(&settings, "test");
+    let mut tx = test_repo.repo.start_transaction(&settings);
     let commit_a = write_random_commit(tx.mut_repo(), &settings);
-    let repo = tx.commit();
+    let repo = tx.commit("test");
 
-    let mut tx1 = repo.start_transaction(&settings, "test");
+    let mut tx1 = repo.start_transaction(&settings);
     let commit_b = create_random_commit(tx1.mut_repo(), &settings)
         .set_parents(vec![commit_a.id().clone()])
         .write()
         .unwrap();
 
-    let mut tx2 = repo.start_transaction(&settings, "test");
+    let mut tx2 = repo.start_transaction(&settings);
     let commit_a2 = tx2
         .mut_repo()
         .rewrite_commit(&settings, &commit_a)
@@ -572,24 +508,24 @@ fn test_merge_views_child_on_rewritten_divergent(on_rewritten: bool, child_first
     // gets rebased onto A4 if it was based on A2 before, but if it was based on
     // A3, it should remain there.
     let settings = testutils::user_settings();
-    let test_repo = TestRepo::init(false);
+    let test_repo = TestRepo::init();
 
-    let mut tx = test_repo.repo.start_transaction(&settings, "test");
+    let mut tx = test_repo.repo.start_transaction(&settings);
     let commit_a2 = write_random_commit(tx.mut_repo(), &settings);
     let commit_a3 = create_random_commit(tx.mut_repo(), &settings)
         .set_change_id(commit_a2.change_id().clone())
         .write()
         .unwrap();
-    let repo = tx.commit();
+    let repo = tx.commit("test");
 
-    let mut tx1 = repo.start_transaction(&settings, "test");
+    let mut tx1 = repo.start_transaction(&settings);
     let parent = if on_rewritten { &commit_a2 } else { &commit_a3 };
     let commit_b = create_random_commit(tx1.mut_repo(), &settings)
         .set_parents(vec![parent.id().clone()])
         .write()
         .unwrap();
 
-    let mut tx2 = repo.start_transaction(&settings, "test");
+    let mut tx2 = repo.start_transaction(&settings);
     let commit_a4 = tx2
         .mut_repo()
         .rewrite_commit(&settings, &commit_a2)
@@ -628,23 +564,23 @@ fn test_merge_views_child_on_abandoned(child_first: bool) {
     // We start with commit B on top of commit A. Operation 1 adds commit C on top.
     // Operation 2 abandons B.
     let settings = testutils::user_settings();
-    let test_repo = TestRepo::init(false);
+    let test_repo = TestRepo::init();
 
-    let mut tx = test_repo.repo.start_transaction(&settings, "test");
+    let mut tx = test_repo.repo.start_transaction(&settings);
     let commit_a = write_random_commit(tx.mut_repo(), &settings);
     let commit_b = create_random_commit(tx.mut_repo(), &settings)
         .set_parents(vec![commit_a.id().clone()])
         .write()
         .unwrap();
-    let repo = tx.commit();
+    let repo = tx.commit("test");
 
-    let mut tx1 = repo.start_transaction(&settings, "test");
+    let mut tx1 = repo.start_transaction(&settings);
     let commit_c = create_random_commit(tx1.mut_repo(), &settings)
         .set_parents(vec![commit_b.id().clone()])
         .write()
         .unwrap();
 
-    let mut tx2 = repo.start_transaction(&settings, "test");
+    let mut tx2 = repo.start_transaction(&settings);
     tx2.mut_repo()
         .record_abandoned_commit(commit_b.id().clone());
     tx2.mut_repo().rebase_descendants(&settings).unwrap();

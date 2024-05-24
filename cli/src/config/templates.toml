@@ -1,0 +1,256 @@
+[templates]
+branch_list = '''
+if(remote,
+  if(tracked,
+    "  " ++ separate(" ",
+      label("branch", "@" ++ remote),
+      format_tracked_remote_ref_distances(self),
+    ) ++ format_ref_targets(self),
+    label("branch", name ++ "@" ++ remote) ++ format_ref_targets(self),
+  ),
+  label("branch", name) ++ if(present, format_ref_targets(self), " (deleted)"),
+) ++ "\n"
+'''
+
+commit_summary = 'format_commit_summary_with_refs(self, branches)'
+
+config_list = '''
+if(overridden,
+  label("overridden", indent("# ", name ++ "=" ++ value)),
+  name ++ "=" ++ value,
+) ++ "\n"
+'''
+
+log = 'builtin_log_compact'
+op_log = 'builtin_op_log_compact'
+show = 'builtin_log_detailed'
+
+tag_list = '''
+label("tag", name) ++ format_ref_targets(self) ++ "\n"
+'''
+
+[template-aliases]
+builtin_log_oneline = '''
+if(root,
+  format_root_commit(self),
+  label(if(current_working_copy, "working_copy"),
+    concat(
+      separate(" ",
+        format_short_change_id_with_hidden_and_divergent_info(self),
+        if(author.email(), author.username(), email_placeholder),
+        format_timestamp(committer.timestamp()),
+        branches,
+        tags,
+        working_copies,
+        git_head,
+        format_short_commit_id(commit_id),
+        if(conflict, label("conflict", "conflict")),
+        if(empty, label("empty", "(empty)")),
+        if(description,
+          description.first_line(),
+          label(if(empty, "empty"), description_placeholder),
+        ),
+      ) ++ "\n",
+    ),
+  )
+)
+'''
+builtin_log_compact = '''
+if(root,
+  format_root_commit(self),
+  label(if(current_working_copy, "working_copy"),
+    concat(
+      separate(" ",
+        format_short_change_id_with_hidden_and_divergent_info(self),
+        format_short_signature(author),
+        format_timestamp(committer.timestamp()),
+        branches,
+        tags,
+        working_copies,
+        git_head,
+        format_short_commit_id(commit_id),
+        if(conflict, label("conflict", "conflict")),
+      ) ++ "\n",
+      separate(" ",
+        if(empty, label("empty", "(empty)")),
+        if(description,
+          description.first_line(),
+          label(if(empty, "empty"), description_placeholder),
+        ),
+      ) ++ "\n",
+    ),
+  )
+)
+'''
+builtin_log_comfortable = 'builtin_log_compact ++ "\n"'
+builtin_log_detailed = '''
+concat(
+  "Commit ID: " ++ commit_id ++ "\n",
+  "Change ID: " ++ change_id ++ "\n",
+  surround("Branches: ", "\n", separate(" ", local_branches, remote_branches)),
+  surround("Tags: ", "\n", tags),
+  "Author: " ++ format_detailed_signature(author) ++ "\n",
+  "Committer: " ++ format_detailed_signature(committer)  ++ "\n",
+  "\n",
+  indent("    ",
+    coalesce(description, label(if(empty, "empty"), description_placeholder) ++ "\n")),
+  "\n",
+)
+'''
+
+builtin_op_log_compact = '''
+label(if(current_operation, "current_operation"),
+  coalesce(
+    if(snapshot, format_snapshot_operation(self)),
+    if(root, format_root_operation(self)),
+    format_operation(self),
+  )
+)
+'''
+builtin_op_log_comfortable = 'builtin_op_log_compact ++ "\n"'
+
+description_placeholder = 'label("description placeholder", "(no description set)")'
+email_placeholder = 'label("email placeholder", "(no email set)")'
+name_placeholder = 'label("name placeholder", "(no name set)")'
+commit_summary_separator = 'label("separator", " | ")'
+
+# Hook points for users to customize the default templates:
+'format_short_id(id)' = 'id.shortest(8)'
+'format_short_change_id(id)' = 'format_short_id(id)'
+'format_short_commit_id(id)' = 'format_short_id(id)'
+'format_short_signature(signature)' = '''
+  coalesce(signature.email(), email_placeholder)'''
+'format_detailed_signature(signature)' = '''
+  coalesce(signature.name(), name_placeholder)
+  ++ " <" ++ coalesce(signature.email(), email_placeholder) ++ ">"
+  ++ " (" ++ format_timestamp(signature.timestamp()) ++ ")"'''
+'format_time_range(time_range)' = '''
+  time_range.start().ago() ++ label("time", ", lasted ") ++ time_range.duration()'''
+'format_timestamp(timestamp)' = 'timestamp.local().format("%Y-%m-%d %H:%M:%S")'
+
+'format_commit_summary_with_refs(commit, refs)' = '''
+separate(" ",
+  format_short_change_id_with_hidden_and_divergent_info(commit),
+  format_short_commit_id(commit.commit_id()),
+  separate(commit_summary_separator,
+    refs,
+    separate(" ",
+      if(commit.conflict(), label("conflict", "(conflict)")),
+      if(commit.empty(), label("empty", "(empty)")),
+      if(commit.description(),
+        commit.description().first_line(),
+        label(if(commit.empty(), "empty"), description_placeholder),
+      ),
+    ),
+  ),
+)
+'''
+
+'format_root_commit(root)' = '''
+separate(" ",
+  format_short_change_id(root.change_id()),
+  label("root", "root()"),
+  format_short_commit_id(root.commit_id()),
+  root.branches()
+) ++ "\n"
+'''
+
+'format_ref_targets(ref)' = '''
+if(ref.conflict(),
+  separate("\n",
+    " " ++ label("conflict", "(conflicted)") ++ ":",
+    ref.removed_targets().map(|c| "  - " ++ format_commit_summary_with_refs(c, "")).join("\n"),
+    ref.added_targets().map(|c| "  + " ++ format_commit_summary_with_refs(c, "")).join("\n"),
+  ),
+  ": " ++ format_commit_summary_with_refs(ref.normal_target(), ""),
+)
+'''
+
+'format_tracked_remote_ref_distances(ref)' = '''
+if(ref.tracking_present(), surround("(", ")", separate(", ",
+  if(!ref.tracking_ahead_count().zero(),
+    if(ref.tracking_ahead_count().exact(),
+      "ahead by " ++ ref.tracking_ahead_count().exact() ++ " commits",
+      "ahead by at least " ++ ref.tracking_ahead_count().lower() ++ " commits")),
+  if(!ref.tracking_behind_count().zero(),
+    if(ref.tracking_behind_count().exact(),
+      "behind by " ++ ref.tracking_behind_count().exact() ++ " commits",
+      "behind by at least " ++ ref.tracking_behind_count().lower() ++ " commits")),
+)))
+'''
+
+'format_operation(op)' = '''
+  concat(
+    separate(" ", op.id().short(), op.user(), format_time_range(op.time())), "\n",
+    op.description().first_line(), "\n",
+    if(op.tags(), op.tags() ++ "\n"),
+  )
+'''
+'format_snapshot_operation(op)' = 'format_operation(op)'
+'format_root_operation(root)' = 'separate(" ", root.id().short(), label("root", "root()")) ++ "\n"'
+
+# We have "hidden" override "divergent", since a hidden revision does not cause
+# change id conflicts and is not affected by such conflicts; you have to use the
+# commit id to refer to a hidden revision regardless.
+'format_short_change_id_with_hidden_and_divergent_info(commit)' = '''
+if(commit.hidden(),
+  label("hidden",
+    format_short_change_id(commit.change_id()) ++ " hidden"
+  ),
+  label(if(commit.divergent(), "divergent"),
+    format_short_change_id(commit.change_id()) ++ if(commit.divergent(), "??")
+  )
+)
+'''
+
+builtin_log_node = '''
+coalesce(
+  if(!self, label("elided", "~")),
+  label(
+    separate(" ",
+      if(current_working_copy, "working_copy"),
+      if(immutable, "immutable"),
+      if(conflict, "conflict"),
+    ),
+    coalesce(
+      if(current_working_copy, "@"),
+      if(immutable, "◆"),
+      if(conflict, "×"),
+      "○",
+    )
+  )
+)
+'''
+
+builtin_log_node_ascii = '''
+coalesce(
+  if(!self, label("elided", "~")),
+  label(
+    separate(" ",
+      if(current_working_copy, "working_copy"),
+      if(immutable, "immutable"),
+      if(conflict, "conflict"),
+    ),
+    coalesce(
+      if(current_working_copy, "@"),
+      if(immutable, "+"),
+      if(conflict, "x"),
+      "o",
+    )
+  )
+)
+'''
+
+builtin_op_log_node = '''
+coalesce(
+  if(current_operation, label("current_operation", "@")),
+  "○",
+)
+'''
+
+builtin_op_log_node_ascii = '''
+coalesce(
+  if(current_operation, label("current_operation", "@")),
+  "o",
+)
+'''

@@ -18,16 +18,17 @@
 //! a parent file, and the parent may have its own parent, and so on. The child
 //! file then represents the union of the entries.
 
+#![allow(missing_docs)]
+
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io;
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use blake2::{Blake2b512, Digest};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
@@ -49,14 +50,8 @@ pub trait TableSegment {
     }
 
     fn get_value<'a>(&'a self, key: &[u8]) -> Option<&'a [u8]> {
-        if let Some(value) = self.segment_get_value(key) {
-            return Some(value);
-        }
-        let parent_file = self.segment_parent_file()?;
-        let parent_file: &ReadonlyTable = parent_file.as_ref();
-        // The parent ReadonlyIndex outlives the child
-        let parent_file: &'a ReadonlyTable = unsafe { std::mem::transmute(parent_file) };
-        parent_file.get_value(key)
+        self.segment_get_value(key)
+            .or_else(|| self.segment_parent_file()?.get_value(key))
     }
 }
 
@@ -78,7 +73,12 @@ impl ReadonlyTable {
         name: String,
         key_size: usize,
     ) -> TableStoreResult<Arc<ReadonlyTable>> {
-        let parent_filename_len = file.read_u32::<LittleEndian>()?;
+        let read_u32 = |file: &mut dyn Read| -> io::Result<u32> {
+            let mut buf = [0; 4];
+            file.read_exact(&mut buf)?;
+            Ok(u32::from_le_bytes(buf))
+        };
+        let parent_filename_len = read_u32(file)?;
         let maybe_parent_file = if parent_filename_len > 0 {
             let mut parent_filename_bytes = vec![0; parent_filename_len as usize];
             file.read_exact(&mut parent_filename_bytes)?;
@@ -88,7 +88,7 @@ impl ReadonlyTable {
         } else {
             None
         };
-        let num_local_entries = file.read_u32::<LittleEndian>()? as usize;
+        let num_local_entries = read_u32(file)? as usize;
         let index_size = num_local_entries * ReadonlyTableIndexEntry::size(key_size);
         let mut data = vec![];
         file.read_to_end(&mut data)?;
@@ -173,7 +173,7 @@ impl<'table> ReadonlyTableIndexEntry<'table> {
     fn new(table: &'table ReadonlyTable, pos: usize) -> Self {
         let entry_size = ReadonlyTableIndexEntry::size(table.key_size);
         let offset = entry_size * pos;
-        let data = &table.index[offset..offset + entry_size];
+        let data = &table.index[offset..][..entry_size];
         ReadonlyTableIndexEntry { data }
     }
 
@@ -186,9 +186,7 @@ impl<'table> ReadonlyTableIndexEntry<'table> {
     }
 
     fn value_offset(&self) -> usize {
-        (&self.data[self.data.len() - 4..self.data.len()])
-            .read_u32::<LittleEndian>()
-            .unwrap() as usize
+        u32::from_le_bytes(self.data[self.data.len() - 4..].try_into().unwrap()) as usize
     }
 }
 
@@ -225,6 +223,8 @@ impl MutableTable {
         other.segment_add_entries_to(self);
     }
 
+    #[allow(unknown_lints)] // XXX FIXME (aseipp): nightly bogons; re-test this occasionally
+    #[allow(clippy::assigning_clones)]
     fn merge_in(&mut self, other: &Arc<ReadonlyTable>) {
         let mut maybe_own_ancestor = self.parent_file.clone();
         let mut maybe_other_ancestor = Some(other.clone());
@@ -260,24 +260,22 @@ impl MutableTable {
         let mut buf = vec![];
 
         if let Some(parent_file) = &self.parent_file {
-            buf.write_u32::<LittleEndian>(parent_file.name.len() as u32)
-                .unwrap();
-            buf.write_all(parent_file.name.as_bytes()).unwrap();
+            buf.extend(u32::try_from(parent_file.name.len()).unwrap().to_le_bytes());
+            buf.extend_from_slice(parent_file.name.as_bytes());
         } else {
-            buf.write_u32::<LittleEndian>(0).unwrap();
+            buf.extend(0_u32.to_le_bytes());
         }
 
-        buf.write_u32::<LittleEndian>(self.entries.len() as u32)
-            .unwrap();
+        buf.extend(u32::try_from(self.entries.len()).unwrap().to_le_bytes());
 
-        let mut value_offset = 0;
+        let mut value_offset = 0_u32;
         for (key, value) in &self.entries {
-            buf.write_all(key).unwrap();
-            buf.write_u32::<LittleEndian>(value_offset).unwrap();
-            value_offset += value.len() as u32;
+            buf.extend_from_slice(key);
+            buf.extend(value_offset.to_le_bytes());
+            value_offset += u32::try_from(value.len()).unwrap();
         }
         for value in self.entries.values() {
-            buf.write_all(value).unwrap();
+            buf.extend_from_slice(value);
         }
         buf
     }
@@ -285,6 +283,8 @@ impl MutableTable {
     /// If the MutableTable has more than half the entries of its parent
     /// ReadonlyTable, return MutableTable with the commits from both. This
     /// is done recursively, so the stack of index files has O(log n) files.
+    #[allow(unknown_lints)] // XXX FIXME (aseipp): nightly bogons; re-test this occasionally
+    #[allow(clippy::assigning_clones)]
     fn maybe_squash_with_ancestors(self) -> MutableTable {
         let mut num_new_entries = self.entries.len();
         let mut files_to_squash = vec![];
@@ -337,8 +337,7 @@ impl MutableTable {
         file.write_all(&buf)?;
         persist_content_addressed_temp_file(temp_file, file_path)?;
 
-        let mut cursor = Cursor::new(&buf);
-        ReadonlyTable::load_from(&mut cursor, store, file_id_hex, store.key_size)
+        ReadonlyTable::load_from(&mut buf.as_slice(), store, file_id_hex, store.key_size)
     }
 }
 
@@ -364,10 +363,7 @@ impl TableSegment for MutableTable {
 
 #[derive(Debug, Error)]
 #[error(transparent)]
-pub enum TableStoreError {
-    IoError(#[from] io::Error),
-    PersistError(#[from] tempfile::PersistError),
-}
+pub struct TableStoreError(#[from] pub io::Error);
 
 pub type TableStoreResult<T> = Result<T, TableStoreError>;
 
@@ -409,7 +405,9 @@ impl TableStore {
         let table = mut_table.save_in(self)?;
         self.add_head(&table)?;
         if let Some(parent_table) = maybe_parent_table {
-            self.remove_head(&parent_table);
+            if parent_table.name != table.name {
+                self.remove_head(&parent_table);
+            }
         }
         {
             let mut locked_cache = self.cached_tables.write().unwrap();
@@ -477,29 +475,35 @@ impl TableStore {
             // head. Note that the locking isn't necessary for correctness; we
             // take the lock only to avoid other concurrent processes from doing
             // the same work (and producing another set of divergent heads).
-            let _lock = self.lock();
-            let mut tables = self.get_head_tables()?;
-
-            if tables.is_empty() {
-                let empty_table = MutableTable::full(self.key_size);
-                return self.save_table(empty_table);
-            }
-
-            if tables.len() == 1 {
-                // Return early so we don't write a table with no changes compared to its parent
-                return Ok(tables.pop().unwrap());
-            }
-
-            let mut merged_table = MutableTable::incremental(tables[0].clone());
-            for other in &tables[1..] {
-                merged_table.merge_in(other);
-            }
-            let merged_table = self.save_table(merged_table)?;
-            for table in &tables[1..] {
-                self.remove_head(table);
-            }
-            Ok(merged_table)
+            let (table, _) = self.get_head_locked()?;
+            Ok(table)
         }
+    }
+
+    pub fn get_head_locked(&self) -> TableStoreResult<(Arc<ReadonlyTable>, FileLock)> {
+        let lock = self.lock();
+        let mut tables = self.get_head_tables()?;
+
+        if tables.is_empty() {
+            let empty_table = MutableTable::full(self.key_size);
+            let table = self.save_table(empty_table)?;
+            return Ok((table, lock));
+        }
+
+        if tables.len() == 1 {
+            // Return early so we don't write a table with no changes compared to its parent
+            return Ok((tables.pop().unwrap(), lock));
+        }
+
+        let mut merged_table = MutableTable::incremental(tables[0].clone());
+        for other in &tables[1..] {
+            merged_table.merge_in(other);
+        }
+        let merged_table = self.save_table(merged_table)?;
+        for table in &tables[1..] {
+            self.remove_head(table);
+        }
+        Ok((merged_table, lock))
     }
 }
 
@@ -675,5 +679,22 @@ mod tests {
         assert_eq!(merged_table.get_value(b"yyy"), Some(b"val5".as_slice()));
         assert_eq!(merged_table.get_value(b"zzz"), Some(b"val3".as_slice()));
         assert_eq!(merged_table.get_value(b"\xff\xff\xff"), None);
+    }
+
+    #[test]
+    fn stacked_table_store_save_empty() {
+        let temp_dir = testutils::new_temp_dir();
+        let store = TableStore::init(temp_dir.path().to_path_buf(), 3);
+
+        let mut mut_table = store.get_head().unwrap().start_mutation();
+        mut_table.add_entry(b"abc".to_vec(), b"value".to_vec());
+        store.save_table(mut_table).unwrap();
+
+        let mut_table = store.get_head().unwrap().start_mutation();
+        store.save_table(mut_table).unwrap();
+
+        // Table head shouldn't be removed on empty save
+        let table = store.get_head().unwrap();
+        assert_eq!(table.get_value(b"abc"), Some(b"value".as_slice()));
     }
 }

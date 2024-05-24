@@ -1,23 +1,25 @@
 [package]
 name = "testutils"
-version = "0.7.0"
-authors = ["Martin von Zweigbergk <martinvonz@google.com>"]
-edition = "2021"
-rust-version = "1.61"
-license = "Apache-2.0"
-description = "Integration test utils for the jujutsu-lib crate"
-homepage = "https://github.com/martinvonz/jj"
-repository = "https://github.com/martinvonz/jj"
-documentation = "https://docs.rs/jujutsu"
-readme = "../..//README.md"
+description = "Integration test utils for the jj-lib crate"
 publish = false
+
+version = { workspace = true }
+edition = { workspace = true }
+rust-version = { workspace = true }
+license = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+documentation = { workspace = true }
+readme = { workspace = true }
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-config = { version = "0.13.2", default-features = false, features = ["toml"] }
-git2 = "0.16.1"
-itertools = "0.10.5"
-jujutsu-lib = { path = ".." }
-rand = "0.8.5"
-tempfile = "3.5.0"
+async-trait = { workspace = true }
+config = { workspace = true }
+git2 = { workspace = true }
+hex = { workspace = true }
+itertools = { workspace = true }
+jj-lib = { workspace = true }
+rand = { workspace = true }
+tempfile = { workspace = true }
