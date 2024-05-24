@@ -105,6 +105,7 @@ jobs:
     name: Check prettier
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29
       - uses: creyD/prettier_action@31355f8eef017f8aeba2e0bc09d8502b13dbbad1
         with:
           dry: true
