@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// @nocommit
 #![allow(missing_docs)]
 #![allow(clippy::let_unit_value)]
 
@@ -52,6 +53,7 @@ use tracing::trace_span;
 
 use crate::backend::BackendError;
 use crate::backend::BackendResult;
+use crate::backend::CommitId;
 use crate::backend::FileId;
 use crate::backend::MergedTreeId;
 use crate::backend::MillisSinceEpoch;
@@ -65,6 +67,7 @@ use crate::conflicts::materialize_tree_value;
 use crate::conflicts::MaterializedTreeValue;
 use crate::file_util::check_symlink_support;
 use crate::file_util::try_symlink;
+use crate::fsmonitor::git_status;
 #[cfg(feature = "watchman")]
 use crate::fsmonitor::watchman;
 use crate::fsmonitor::FsmonitorSettings;
@@ -508,10 +511,21 @@ fn file_state(metadata: &Metadata) -> Option<FileState> {
     })
 }
 
+// @nocommit: document
+enum FsmonitorData {
+    None,
+    Test,
+    Watchman {
+        watchman_clock: Option<crate::protos::working_copy::WatchmanClock>,
+    },
+    GitStatus {
+        head_commit_id: Option<CommitId>,
+    },
+}
+
 struct FsmonitorMatcher {
-    base_tree_id: MergedTreeId,
     matcher: Option<Box<dyn Matcher>>,
-    watchman_clock: Option<crate::protos::working_copy::WatchmanClock>,
+    data: FsmonitorData,
 }
 
 struct DirectoryToVisit<'a> {
@@ -790,6 +804,28 @@ impl TreeState {
             .map_err(|err| TreeStateError::Fsmonitor(Box::new(err)))
     }
 
+    fn query_git_status(&self) -> Result<git_status::StatusOutput, TreeStateError> {
+        // TODO: keep in mind that `git status` shows since the most recent
+        // commit; does this work properly with jj?
+        let status_output = git_status::query_git_status(
+            Path::new("git"),
+            &self.working_copy_path,
+            git_status::StatusOptions {
+                untracked_files: git_status::UntrackedFilesMode::All,
+
+                // FIXME: If the user modified a `.gitignore` file, then there
+                // may be newly-ignored files that we don't know to visit?
+                //
+                // However, we can't fix it by just unconditionally asking for
+                // all ignored files is a big performance issue since then Git
+                // has to traverse e.g. build directories.
+                ignored: git_status::IgnoredMode::No,
+            },
+        )
+        .map_err(|err| TreeStateError::Fsmonitor(Box::new(err)))?;
+        Ok(status_output)
+    }
+
     /// Look for changes to the working copy. If there are any changes, create
     /// a new tree from it and return it, and also update the dirstate on disk.
     #[instrument(skip_all)]
@@ -804,12 +840,16 @@ impl TreeState {
 
         let sparse_matcher = self.sparse_matcher();
 
-        let fsmonitor_clock_needs_save = *fsmonitor_settings != FsmonitorSettings::None;
+        let fsmonitor_clock_needs_save = match fsmonitor_settings {
+            FsmonitorSettings::Watchman(_) => true,
+            FsmonitorSettings::GitStatus
+            | FsmonitorSettings::Test { changed_files: _ }
+            | FsmonitorSettings::None => false,
+        };
         let mut is_dirty = fsmonitor_clock_needs_save;
         let FsmonitorMatcher {
-            base_tree_id,
             matcher: fsmonitor_matcher,
-            watchman_clock,
+            data: fsmonitor_data,
         } = self.make_fsmonitor_matcher(fsmonitor_settings)?;
         let fsmonitor_matcher = match fsmonitor_matcher.as_ref() {
             None => &EverythingMatcher,
@@ -819,7 +859,7 @@ impl TreeState {
         let matcher = IntersectionMatcher::new(sparse_matcher.as_ref(), fsmonitor_matcher);
         if matcher.visit(RepoPath::root()).is_nothing() {
             // No need to iterate file states to build empty deleted_files.
-            self.watchman_clock = watchman_clock;
+            self.set_fsmonitor_persistent_data(fsmonitor_data);
             return Ok(is_dirty);
         }
 
@@ -827,8 +867,19 @@ impl TreeState {
         let (file_states_tx, file_states_rx) = channel();
         let (present_files_tx, present_files_rx) = channel();
 
+        let base_tree = match &fsmonitor_data {
+            FsmonitorData::None
+            | FsmonitorData::Test
+            | FsmonitorData::Watchman { watchman_clock: _ } => self.current_tree()?,
+            FsmonitorData::GitStatus { head_commit_id } => {
+                let head_commit_id = head_commit_id
+                    .as_ref()
+                    .unwrap_or_else(|| self.store.root_commit_id());
+                let head_commit = self.store.get_commit(head_commit_id)?;
+                head_commit.tree()?
+            }
+        };
         trace_span!("traverse filesystem").in_scope(|| -> Result<(), SnapshotError> {
-            let current_tree = self.store.get_root_tree(&base_tree_id)?;
             let directory_to_visit = DirectoryToVisit {
                 dir: RepoPathBuf::root(),
                 disk_dir: self.working_copy_path.clone(),
@@ -838,7 +889,7 @@ impl TreeState {
             self.visit_directory(
                 &matcher,
                 start_tracking_matcher,
-                &current_tree,
+                &base_tree,
                 tree_entries_tx,
                 file_states_tx,
                 present_files_tx,
@@ -848,7 +899,7 @@ impl TreeState {
             )
         })?;
 
-        let mut tree_builder = MergedTreeBuilder::new(base_tree_id.clone());
+        let mut tree_builder = MergedTreeBuilder::new(base_tree.id().clone());
         let mut deleted_files: HashSet<_> =
             trace_span!("collecting existing files").in_scope(|| {
                 // Since file_states shouldn't contain files excluded by the sparse patterns,
@@ -864,18 +915,21 @@ impl TreeState {
             });
         trace_span!("process tree entries").in_scope(|| -> Result<(), SnapshotError> {
             while let Ok((path, tree_values)) = tree_entries_rx.recv() {
+                is_dirty = true;
+                tracing::warn!(?path, "processing tree entry @nocommit");
                 tree_builder.set_or_remove(path, tree_values);
             }
             Ok(())
         })?;
         trace_span!("process present files").in_scope(|| {
             while let Ok(path) = present_files_rx.recv() {
+                tracing::warn!(?path, "processing present file @nocommit");
                 deleted_files.remove(&path);
             }
         });
         trace_span!("process deleted tree entries").in_scope(|| {
-            is_dirty |= !deleted_files.is_empty();
             for file in &deleted_files {
+                is_dirty = true;
                 tree_builder.set_or_remove(file.clone(), Merge::absent());
             }
         });
@@ -891,9 +945,12 @@ impl TreeState {
         trace_span!("write tree").in_scope(|| {
             let new_tree_id = tree_builder.write_tree(&self.store).unwrap();
             is_dirty |= new_tree_id != self.tree_id;
+            tracing::warn!(?self.tree_id, ?new_tree_id, "new tree id @nocommit");
             self.tree_id = new_tree_id;
         });
-        if cfg!(debug_assertions) {
+        if cfg!(debug_assertions) || true
+        /* @nocommit */
+        {
             let tree = self.current_tree().unwrap();
             let tree_paths: HashSet<_> = tree
                 .entries_matching(sparse_matcher.as_ref())
@@ -903,8 +960,23 @@ impl TreeState {
             let state_paths: HashSet<_> = file_states.paths().map(|path| path.to_owned()).collect();
             assert_eq!(state_paths, tree_paths);
         }
-        self.watchman_clock = watchman_clock;
+        self.set_fsmonitor_persistent_data(fsmonitor_data);
         Ok(is_dirty)
+    }
+
+    fn set_fsmonitor_persistent_data(&mut self, fsmonitor_data: FsmonitorData) {
+        match fsmonitor_data {
+            FsmonitorData::None | FsmonitorData::Test => {
+                // Do nothing.
+            }
+            FsmonitorData::Watchman { watchman_clock } => {
+                self.watchman_clock = watchman_clock;
+            }
+            FsmonitorData::GitStatus { head_commit_id: _ } => {
+                // All persistent data is stored in the Git index, etc., so
+                // don't need to persist any data ourselves.
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -930,6 +1002,7 @@ impl TreeState {
         if matcher.visit(&dir).is_nothing() {
             return Ok(());
         }
+        tracing::debug!(?dir, "visiting directory @nocommit");
 
         let git_ignore = git_ignore
             .chain_with_file(&dir.to_internal_dir_string(), disk_dir.join(".gitignore"))?;
@@ -1093,15 +1166,27 @@ impl TreeState {
         &self,
         fsmonitor_settings: &FsmonitorSettings,
     ) -> Result<FsmonitorMatcher, SnapshotError> {
-        let (watchman_clock, changed_files) = match fsmonitor_settings {
-            FsmonitorSettings::None => (None, None),
-            FsmonitorSettings::Test { changed_files } => (None, Some(changed_files.clone())),
+        let (data, changed_files) = match fsmonitor_settings {
+            FsmonitorSettings::None => (FsmonitorData::None, None),
+            FsmonitorSettings::Test { changed_files } => {
+                (FsmonitorData::Test, Some(changed_files.clone()))
+            }
             #[cfg(feature = "watchman")]
             FsmonitorSettings::Watchman(config) => match self.query_watchman(config) {
-                Ok((watchman_clock, changed_files)) => (Some(watchman_clock.into()), changed_files),
+                Ok((watchman_clock, changed_files)) => (
+                    FsmonitorData::Watchman {
+                        watchman_clock: Some(watchman_clock.into()),
+                    },
+                    changed_files,
+                ),
                 Err(err) => {
-                    tracing::warn!(?err, "Failed to query filesystem monitor");
-                    (None, None)
+                    tracing::error!(?err, "Failed to query Watchman filesystem monitor, falling back to normal snapshotting");
+                    (
+                        FsmonitorData::Watchman {
+                            watchman_clock: None,
+                        },
+                        None,
+                    )
                 }
             },
             #[cfg(not(feature = "watchman"))]
@@ -1113,13 +1198,53 @@ impl TreeState {
                         .into(),
                 });
             }
-            FsmonitorKind::GitStatus => {
-                let status_files = self.query_git_status()?;
-            }
+            FsmonitorSettings::GitStatus => match self.query_git_status() {
+                Ok(status_output) => {
+                    tracing::debug!(
+                        ?status_output,
+                        "got git-status filesystem monitor status output"
+                    );
+                    let git_status::StatusOutput {
+                        head_commit_id,
+                        files,
+                    } = status_output;
+                    let changed_files = files
+                        .into_iter()
+                        .map(|status_file| {
+                            let git_status::StatusFile { path } = status_file;
+                            path
+                        })
+                        .collect();
+                    (
+                        FsmonitorData::GitStatus { head_commit_id },
+                        Some(changed_files),
+                    )
+                }
+                Err(err) => {
+                    tracing::error!(?err, "Failed to query git-status filesystem monitor, falling back to normal snapshotting");
+                    (
+                        // NOTE: Can't construct `FsmonitorData::GitStatus`
+                        // without the base tree ID; we're relying on the fact
+                        // that the git-status fsmonitor doesn't need to persist
+                        // any state from the returned data (in
+                        // `set_fsmonitor_persistent_data`).
+                        FsmonitorData::None,
+                        None,
+                    )
+                }
+            },
         };
+
         let matcher: Option<Box<dyn Matcher>> = match changed_files {
             None => None,
             Some(changed_files) => {
+                let changed_files_len = changed_files.len();
+                tracing::debug!(
+                    ?changed_files_len,
+                    ?changed_files,
+                    "got changed files from fsmonitor"
+                );
+
                 let repo_paths = trace_span!("processing fsmonitor paths").in_scope(|| {
                     changed_files
                         .into_iter()
@@ -1130,10 +1255,7 @@ impl TreeState {
                 Some(Box::new(FilesMatcher::new(repo_paths)))
             }
         };
-        Ok(FsmonitorMatcher {
-            matcher,
-            watchman_clock,
-        })
+        Ok(FsmonitorMatcher { matcher, data })
     }
 
     fn get_updated_tree_value(
