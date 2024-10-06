@@ -704,6 +704,9 @@ pub mod git_status {
         /// Format: `! <path>`
         ignored: regex::bytes::Regex,
     }
+    // @nocommit current race:
+    // 2024-09-26T23:40:01.768379Z  WARN run:run_internal:run_command:cmd_status:workspace_helper:maybe_snapshot:snapshot_working_copy:snapshot: jj_lib::local_working_copy: new tree id @nocommit self.tree_id=Merge(Resolved(TreeId("5fa81d1b6a223e372de83c561fbb3a104a6154a3"))) new_tree_id=Merge(Resolved(TreeId("cdca3a3b94314efb85a1d327a1f8a4d6e8685231")))
+    // 2024-09-26T23:40:13.043864Z  WARN run:run_internal:run_command:cmd_status:workspace_helper:maybe_snapshot:snapshot_working_copy:snapshot: jj_lib::local_working_copy: new tree id @nocommit self.tree_id=Merge(Resolved(TreeId("cdca3a3b94314efb85a1d327a1f8a4d6e8685231"))) new_tree_id=Merge(Resolved(TreeId("5fa81d1b6a223e372de83c561fbb3a104a6154a3")))
 
     impl Regexes {
         fn new() -> Result<Self, regex::Error> {

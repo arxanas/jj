@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// @nocommit
 #![allow(missing_docs)]
 #![allow(clippy::let_unit_value)]
 
@@ -879,6 +878,7 @@ impl TreeState {
                 head_commit.tree()?
             }
         };
+        tracing::warn!(base_tree_id = ?base_tree.id(), "base tree id @nocommit");
         trace_span!("traverse filesystem").in_scope(|| -> Result<(), SnapshotError> {
             let directory_to_visit = DirectoryToVisit {
                 dir: RepoPathBuf::root(),
